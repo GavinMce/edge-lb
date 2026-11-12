@@ -2,7 +2,8 @@
 
 > **New:** [`service/`](service/README.md) is a Rust controller + web UI that creates, runs and
 > destroys a fleet of edges (Hetzner or any machine you can SSH into) and manages routes across
-> them. The Terraform modules below are the original single-edge setup and remain usable.
+> them, and reaches services behind CGNAT through a managed WireGuard gateway. The Terraform modules below are
+> the original single-edge setup and remain usable.
 
 A tiny self-hosted edge load balancer: a public Linux machine that forwards TLS and TCP
 traffic over WireGuard to a home network or Kubernetes cluster. Your home IP is never

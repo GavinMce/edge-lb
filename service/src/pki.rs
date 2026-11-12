@@ -65,6 +65,41 @@ pub fn self_signed_server() -> Result<Pem> {
     Ok(Pem { cert: cert.pem(), key: key.serialize_pem() })
 }
 
+/// A self-signed certificate for the controller's gateway listener.
+pub fn self_signed_controller() -> Result<Pem> {
+    let key = KeyPair::generate()?;
+    let mut p = CertificateParams::new(vec!["edge-lb-controller".to_string()])?;
+    p.distinguished_name.push(DnType::CommonName, "edge-lb controller (gateways)");
+    p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let cert = p.self_signed(&key)?;
+    Ok(Pem { cert: cert.pem(), key: key.serialize_pem() })
+}
+
+/// The pin curl understands: `sha256//` + base64 of the SHA-256 of the certificate's public key
+/// (`--pinnedpubkey`). Gateways pin the whole certificate; the install script's `curl` pins this.
+pub fn spki_pin(key_pem: &str) -> Result<String> {
+    use rcgen::PublicKeyData;
+    let key = KeyPair::from_pem(key_pem).context("private key")?;
+    Ok(format!("sha256//{}", base64_encode(&Sha256::digest(key.subject_public_key_info()))))
+}
+
+pub fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 pub fn certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -103,6 +138,22 @@ mod tests {
         assert_eq!(fp.len(), 64);
         assert_eq!(fp, fingerprint_pem(&server.cert).unwrap());
         assert_ne!(fp, fingerprint_pem(&ca.cert).unwrap());
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(base64_encode(i.as_bytes()), o);
+        }
+    }
+
+    #[test]
+    fn spki_pin_is_stable_and_curl_shaped() {
+        let c = self_signed_controller().unwrap();
+        let p = spki_pin(&c.key).unwrap();
+        assert!(p.starts_with("sha256//") && p.len() == "sha256//".len() + 44, "{p}");
+        assert_eq!(p, spki_pin(&c.key).unwrap());
+        assert_ne!(p, spki_pin(&self_signed_controller().unwrap().key).unwrap());
     }
 
     #[test]

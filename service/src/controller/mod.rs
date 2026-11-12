@@ -12,6 +12,7 @@ pub mod dns;
 pub mod lifecycle;
 pub mod model;
 pub mod providers;
+pub mod sites;
 pub mod store;
 
 use crate::config::{self, Route};
@@ -25,6 +26,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use sites::{GatewayEndpoint, GatewayListen, GwLive};
 use store::Store;
 use tokio::sync::OnceCell;
 
@@ -48,6 +50,8 @@ pub struct Options {
     pub reserved_ports: Vec<u16>,
     /// Retry delay after a transient failure doubles from `.0` up to `.1`.
     pub retry_backoff: (Duration, Duration),
+    /// Listener for WireGuard gateways. Off unless set, so the controller exposes nothing extra by default.
+    pub gateway: Option<GatewayListen>,
 }
 
 impl Options {
@@ -63,6 +67,7 @@ impl Options {
             default_mgmt_port: DEFAULT_MGMT_PORT,
             reserved_ports: vec![22],
             retry_backoff: (Duration::from_secs(2), Duration::from_secs(30)),
+            gateway: None,
         }
     }
 }
@@ -133,6 +138,9 @@ pub struct Controller {
     /// First-run proof of physical/shell access: needed to create the admin account.
     pub setup_code: Mutex<Option<String>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(crate) gateway: Mutex<Option<GatewayEndpoint>>,
+    pub(crate) gateway_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(crate) gw_live: RwLock<HashMap<String, GwLive>>,
 }
 
 // ---- API-facing types ------------------------------------------------------------------------
@@ -173,6 +181,9 @@ pub struct SettingsUpdate {
     pub hetzner_token: Option<String>,
     pub hetzner_image: Option<String>,
     pub drain_seconds: Option<u64>,
+    /// Only changeable while there are no sites (every tunnel address would move).
+    pub wg_network: Option<String>,
+    pub wg_port: Option<u16>,
     pub dns: Option<DnsUpdate>,
     #[serde(default)]
     pub clear_dns: bool,
@@ -193,7 +204,45 @@ pub struct SettingsView {
     pub hetzner_token_set: bool,
     pub hetzner_image: String,
     pub drain_seconds: u64,
+    pub wg_network: String,
+    pub wg_port: u16,
     pub dns: Option<DnsView>,
+}
+
+/// Routes into a site must stay inside it, and routes that don't name a site must stay out of
+/// every site's address space (otherwise they'd silently work through the tunnel).
+fn site_route_errors(s: &State, routes: &[CRoute]) -> Vec<String> {
+    use crate::wg::Cidr;
+    let ranges = |site: &Site| -> Vec<Cidr> { site.lan_cidrs.iter().filter_map(|c| Cidr::parse(c).ok()).collect() };
+    let mut errs = Vec::new();
+    for r in routes {
+        let name = &r.route.name;
+        match r.site.as_deref() {
+            Some(id) => {
+                let Some(site) = s.site(id) else {
+                    errs.push(format!("route '{name}': unknown site '{id}'"));
+                    continue;
+                };
+                let rs = ranges(site);
+                for t in &r.route.targets {
+                    match t.address {
+                        IpAddr::V4(ip) if rs.iter().any(|c| c.contains(ip)) => {}
+                        IpAddr::V4(ip) => errs.push(format!("route '{name}': target {ip} is outside site '{}' ({})", site.name, site.lan_cidrs.join(", "))),
+                        IpAddr::V6(ip) => errs.push(format!("route '{name}': target {ip} is IPv6; sites are IPv4 only")),
+                    }
+                }
+            }
+            None => {
+                for t in &r.route.targets {
+                    let IpAddr::V4(ip) = t.address else { continue };
+                    if let Some(site) = s.sites.iter().find(|x| ranges(x).iter().any(|c| c.contains(ip))) {
+                        errs.push(format!("route '{name}': target {ip} is inside site '{}'; set the route's site so it is sent through that gateway", site.name));
+                    }
+                }
+            }
+        }
+    }
+    errs
 }
 
 fn safe_ident(s: &str) -> bool {
@@ -216,8 +265,18 @@ impl Controller {
             dns_run: Mutex::new(DnsRun::default()),
             setup_code: Mutex::new(None),
             task: Mutex::new(None),
+            gateway: Mutex::new(None),
+            gateway_task: Mutex::new(None),
+            gw_live: RwLock::new(HashMap::new()),
             opts,
         });
+        if c.store.read(|s| s.gateway_tls.is_none()) {
+            let pem = crate::pki::self_signed_controller()?;
+            c.store.update(|s| s.gateway_tls = Some(pem))?;
+        }
+        if let Some(g) = c.opts.gateway.clone() {
+            c.start_gateway_listener(&g).await?;
+        }
         if c.store.read(|s| s.admin.is_none()) {
             use rand::Rng;
             const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -234,6 +293,9 @@ impl Controller {
     /// Stop the lifecycle loop. Edges keep running; nothing is torn down.
     pub fn stop(&self) {
         if let Some(t) = self.task.lock().unwrap().take() {
+            t.abort();
+        }
+        if let Some(t) = self.gateway_task.lock().unwrap().take() {
             t.abort();
         }
     }
@@ -273,6 +335,8 @@ impl Controller {
             hetzner_token_set: s.settings.hetzner_token.is_some(),
             hetzner_image: s.settings.hetzner_image.clone(),
             drain_seconds: s.settings.drain_seconds,
+            wg_network: s.settings.wg_network.clone(),
+            wg_port: s.settings.wg_port,
             dns: s.settings.dns.as_ref().map(|d| DnsView { zone_id: d.zone_id.clone(), names: d.names.clone(), ttl: d.ttl, token_set: !d.cloudflare_token.is_empty() }),
         })
     }
@@ -322,6 +386,14 @@ impl Controller {
                 errs.push("drain_seconds must be at most 3600".into());
             }
         }
+        if let Some(n) = &u.wg_network {
+            if let Err(e) = parse_wg_network(n) {
+                errs.push(e);
+            }
+        }
+        if u.wg_port.is_some_and(|p| p < 1024) {
+            errs.push("wg_port must be between 1024 and 65535".into());
+        }
         let mut dns_names = Vec::new();
         if let Some(d) = &u.dns {
             if !safe_ident(&d.zone_id) {
@@ -345,6 +417,18 @@ impl Controller {
             return Err(CtlError::Invalid(errs));
         }
         self.store.try_update(|s| {
+            if let Some(n) = &u.wg_network {
+                if *n != s.settings.wg_network {
+                    if !s.sites.is_empty() {
+                        return invalid("the tunnel network can't change while sites exist: delete them first, or keep the current network");
+                    }
+                    s.settings.wg_network = n.clone();
+                    // Every address moves into the new network; they're reallocated on the next tick.
+                    for e in &mut s.edges {
+                        e.tunnel_ip = None;
+                    }
+                }
+            }
             let st = &mut s.settings;
             if let Some(n) = u.max_edges {
                 st.max_edges = n;
@@ -357,6 +441,9 @@ impl Controller {
             }
             if let Some(d) = u.drain_seconds {
                 st.drain_seconds = d;
+            }
+            if let Some(p) = u.wg_port {
+                st.wg_port = p;
             }
             if u.clear_dns {
                 st.dns = None;
@@ -445,6 +532,8 @@ impl Controller {
                 attempts: 0,
                 drain_started: None,
                 log: vec![LogEntry { ts: now(), msg: "edge requested".into() }],
+                tunnel_ip: None,
+                wg_public_key: None,
             };
             s.edges.push(edge.clone());
             Ok(edge)
@@ -520,6 +609,7 @@ impl Controller {
                 }
             }
         }
+        errs.extend(site_route_errors(s, routes));
         if !errs.is_empty() {
             return Err(errs);
         }

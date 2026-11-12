@@ -101,7 +101,7 @@ async fn config_push_applies_validates_and_persists() {
         }
     });
     let p = free_port().await;
-    c.put_config(7, &[route("web", p, bport)]).await.unwrap();
+    c.put_config(7, &[route("web", p, bport)], None).await.unwrap();
 
     let mut conn = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
     let mut got = Vec::new();
@@ -113,13 +113,13 @@ async fn config_push_applies_validates_and_persists() {
     assert_eq!(st["routes"].as_array().unwrap().len(), 1);
 
     // An invalid push is rejected with details and leaves the running config alone.
-    let bad = c.put_config(8, &[route("web", p, bport), route("dup", p, bport)]).await.unwrap_err();
+    let bad = c.put_config(8, &[route("web", p, bport), route("dup", p, bport)], None).await.unwrap_err();
     assert!(matches!(bad, ClientError::Rejected(ref d) if !d.is_empty()), "{bad:?}");
     assert_eq!(c.status().await.unwrap()["generation"], 7);
     assert!(TcpStream::connect(("127.0.0.1", p)).await.is_ok());
 
     // The management port itself cannot be used as a route port.
-    let reserved = c.put_config(9, &[route("evil", edge.addr.port(), bport)]).await.unwrap_err();
+    let reserved = c.put_config(9, &[route("evil", edge.addr.port(), bport)], None).await.unwrap_err();
     assert!(matches!(reserved, ClientError::Rejected(_)), "{reserved:?}");
 
     // Restart from the same data dir: same identity (so the pin still holds), same routes, same generation.

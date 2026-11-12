@@ -11,7 +11,10 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use edge_lbd::controller::bootstrap::{Bootstrapper, InstallCtx, Installed, Target};
+use edge_lbd::controller::sites::{GatewayListen, NewSite};
 use edge_lbd::controller::{Controller, Options};
+use edge_lbd::gateway::{self, Handshake, HostWg};
+use edge_lbd::wg::Desired;
 use edge_lbd::edge::{self, EdgeHandle, EdgeOptions};
 use edge_lbd::engine::Options as EngineOptions;
 use serde_json::{json, Value};
@@ -98,7 +101,7 @@ impl Bootstrapper for Machines {
             engine: EngineOptions { data_dir: self.dir.join(&t.edge_id), reserved_ports: vec![], ..Default::default() },
         })
         .await?;
-        let out = Installed { cert_pem: h.cert_pem.clone(), mgmt_port: h.addr.port() };
+        let out = Installed { cert_pem: h.cert_pem.clone(), mgmt_port: h.addr.port(), wg_public_key: Some(demo_key(&t.edge_id)) };
         self.edges.lock().await.insert(t.edge_id.clone(), h);
         Ok(out)
     }
@@ -109,6 +112,30 @@ impl Bootstrapper for Machines {
         Ok(())
     }
     async fn forget(&self, _: &Target) {}
+}
+
+/// A valid WireGuard key that is different for every demo edge (nothing secret: no real tunnel exists).
+fn demo_key(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    edge_lbd::pki::base64_encode(&Sha256::digest(seed.as_bytes()))
+}
+
+/// Pretends to be a gateway host: accepts every config and reports a healthy handshake with each peer.
+struct DemoHost(Mutex<Vec<String>>);
+
+#[async_trait]
+impl HostWg for DemoHost {
+    async fn ensure_key(&self, _: &std::path::Path) -> anyhow::Result<String> {
+        Ok(demo_key("demo-gateway"))
+    }
+    async fn apply(&self, d: &Desired, _: &std::path::Path) -> anyhow::Result<()> {
+        *self.0.lock().unwrap() = d.peers.iter().map(|p| p.public_key.clone()).collect();
+        Ok(())
+    }
+    async fn handshakes(&self) -> Vec<Handshake> {
+        self.0.lock().unwrap().iter().enumerate().map(|(i, k)| Handshake { public_key: k.clone(), age_secs: Some(8 + i as u64 * 31) }).collect()
+    }
+    async fn probe(&self, _: &[std::net::Ipv4Addr]) {}
 }
 
 #[tokio::main]
@@ -133,7 +160,25 @@ async fn main() {
     o.hetzner_base = hz;
     o.bootstrapper = Some(Arc::new(Machines { edges: Default::default(), dir: dir.join("machines") }));
     o.default_mgmt_port = 7443;
+    o.gateway = Some(GatewayListen { listen: "127.0.0.1:0".parse().unwrap(), host: "127.0.0.1".into() });
     let ctl = Controller::start(o).await.unwrap();
+
+    // Two demo sites: "Home" gets a live in-process gateway agent, "Cabin" is waiting for one.
+    ctl.create_site("demo", NewSite { name: "Home".into(), lan_cidrs: vec!["192.168.1.0/24".into()] }).unwrap();
+    ctl.create_site("demo", NewSite { name: "Cabin".into(), lan_cidrs: vec!["192.168.50.0/24".into(), "192.168.51.0/24".into()] }).unwrap();
+    let token = ctl.start_enrolment("demo", "home").unwrap().command.split("/gw/install/").nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let gwdir = dir.join("gateway");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    std::fs::write(gwdir.join("enrol-token"), &token).unwrap();
+    let pem = ctl.store.read(|s| s.gateway_tls.clone().unwrap());
+    tokio::spawn(gateway::run(gateway::Options {
+        controller: ctl.gateway_endpoint().unwrap().hostport,
+        pin: edge_lbd::pki::fingerprint_pem(&pem.cert).unwrap(),
+        data_dir: gwdir,
+        interval: Duration::from_secs(2),
+        host: Arc::new(DemoHost(Mutex::new(vec![]))),
+    }));
+    ctl.start_enrolment("demo", "cabin").unwrap();
     let l = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     println!("demo controller: http://127.0.0.1:{port}  (setup code in {}/controller/setup-code)", dir.display());
     axum::serve(l, edge_lbd::controller::api::router(ctl, false).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();

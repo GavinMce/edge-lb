@@ -6,6 +6,7 @@
 //! console, so a freshly deployed controller can't be claimed by whoever finds it first.
 
 use super::model::now;
+use super::sites::{NewSite, SiteUpdate};
 use super::{auth, Controller, CtlError, NewEdge, SettingsUpdate};
 use crate::controller::model::CRoute;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -230,9 +231,32 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
         "now": now(),
         "edges": c.edges(),
         "routes": c.routes(),
+        "sites": c.sites(),
+        "gateway_listener": c.gateway_endpoint().map(|g| g.hostport),
         "dns": c.dns_status(),
         "dns_names": c.store.read(|s| s.settings.dns.as_ref().map(|d| d.names.clone())),
     }))
+}
+
+async fn list_sites(State(st): State<AppState>) -> Json<Value> {
+    Json(json!(st.ctl.sites()))
+}
+
+async fn create_site(State(st): State<AppState>, Extension(Actor(u)): Extension<Actor>, Json(n): Json<NewSite>) -> Res<Response> {
+    Ok((StatusCode::CREATED, Json(st.ctl.create_site(&u, n)?)).into_response())
+}
+
+async fn update_site(State(st): State<AppState>, Extension(Actor(u)): Extension<Actor>, Path(id): Path<String>, Json(b): Json<SiteUpdate>) -> Res<Response> {
+    Ok(Json(st.ctl.update_site(&u, &id, b)?).into_response())
+}
+
+async fn delete_site(State(st): State<AppState>, Extension(Actor(u)): Extension<Actor>, Path(id): Path<String>) -> Res<StatusCode> {
+    st.ctl.delete_site(&u, &id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn enrol_site(State(st): State<AppState>, Extension(Actor(u)): Extension<Actor>, Path(id): Path<String>) -> Res<Response> {
+    Ok(Json(st.ctl.start_enrolment(&u, &id)?).into_response())
 }
 
 async fn list_edges(State(st): State<AppState>) -> Json<Value> {
@@ -317,6 +341,9 @@ pub fn router(ctl: Arc<Controller>, secure_cookies: bool) -> Router {
         .route("/edges/:id/retry", post(retry_edge))
         .route("/edges/:id/forget", post(forget_edge))
         .route("/catalog", get(catalog))
+        .route("/sites", get(list_sites).post(create_site))
+        .route("/sites/:id", axum::routing::put(update_site).delete(delete_site))
+        .route("/sites/:id/enrol", post(enrol_site))
         .route("/routes", get(list_routes).post(create_route))
         .route("/routes/:id", axum::routing::put(update_route).delete(delete_route))
         .route("/settings", get(get_settings).put(put_settings))

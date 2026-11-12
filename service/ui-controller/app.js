@@ -60,6 +60,14 @@ function ago(ts) {
   if (s < 129600) return Math.round(s / 3600) + 'h ago';
   return Math.round(s / 86400) + 'd ago';
 }
+/** "12m" until a timestamp in the future. */
+function inFuture(ts) {
+  const s = Math.max(0, Math.round(ts - Date.now() / 1000));
+  if (s < 90) return s + 's';
+  if (s < 5400) return Math.round(s / 60) + 'm';
+  return Math.round(s / 3600) + 'h';
+}
+
 function fmtBytes(n) {
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
   let i = 0;
@@ -190,6 +198,10 @@ function renderPills() {
     h('span', { class: 'pill' }, h('b', null, `${healthy}/${st.edges.length}`), ' edges healthy'),
     h('span', { class: 'pill' }, h('b', null, st.routes.length), ' routes'),
   ];
+  if (st.sites && st.sites.length) {
+    const online = st.sites.filter((x) => x.gateway.online).length;
+    pills.push(h('span', { class: 'pill' + (online < st.sites.length ? ' warn' : '') }, h('b', null, `${online}/${st.sites.length}`), ' gateways online'));
+  }
   if (st.dns_names) {
     const d = st.dns;
     const bad = d.last_error, held = d.held;
@@ -202,7 +214,7 @@ function renderPills() {
 }
 
 function setTab(tab) {
-  S.tab = ['edges', 'routes', 'settings', 'activity'].includes(tab) ? tab : 'edges';
+  S.tab = ['edges', 'sites', 'routes', 'settings', 'activity'].includes(tab) ? tab : 'edges';
   document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === S.tab));
   renderPage(true);
 }
@@ -211,6 +223,7 @@ window.addEventListener('hashchange', () => setTab(location.hash.replace('#/', '
 function renderPage(full) {
   const main = $('#main');
   if (S.tab === 'edges') return renderEdges(main);
+  if (S.tab === 'sites') return renderSites(main);
   if (S.tab === 'routes') return renderRoutes(main);
   if (!full) return; // settings & activity are not live: don't clobber what the user is typing
   if (S.tab === 'settings') return renderSettings(main);
@@ -230,6 +243,15 @@ function stepBar(e) {
     STEPS.map((name, i) => h('i', { class: i < info.step ? 'done' : i === info.step ? 'now' : '', title: name })));
 }
 
+/** One line about the edge's WireGuard side, shown once it matters (sites exist or it is set up). */
+function tunnelNote(e) {
+  const sites = (S.status && S.status.sites) || [];
+  const serving = ['healthy', 'unreachable', 'joining', 'draining'].includes(e.status);
+  if (e.wg_public_key) return h('div', { class: 'sub', title: 'This edge reaches sites over WireGuard' }, 'tunnel ' + (e.tunnel_ip || '…'));
+  if (serving && sites.length) return h('div', { class: 'sub warn-text', title: 'WireGuard was not available when this edge was installed, so it cannot reach sites' }, 'no WireGuard: cannot reach sites');
+  return null;
+}
+
 function edgeCard(e) {
   const info = STATUS[e.status] || { label: e.status, cls: '' };
   const live = e.live, ls = live && live.status;
@@ -247,6 +269,7 @@ function edgeCard(e) {
       h('div', { class: 'mono' }, e.ip ? addr(e.ip, e.mgmt_port).replace(/:\d+$/, '') : 'pending…'),
       h('div', { class: 'sub' }, providerText(e)),
       live && live.version && h('div', { class: 'sub' }, 'edge v' + live.version),
+      tunnelNote(e),
     ),
     h('div', { class: 'cell' },
       h('span', { class: 'label' }, 'Status'),
@@ -405,6 +428,128 @@ $('#edge-form').addEventListener('submit', async (ev) => {
   }
 });
 
+// ---- sites page --------------------------------------------------------------------------
+
+function gatewayState(g) {
+  if (!g.enrolled) return g.enrol_pending_until ? { label: 'Waiting for gateway', cls: 'warn' } : { label: 'No gateway yet', cls: '' };
+  if (!g.online) return { label: 'Offline', cls: 'bad' };
+  if (g.error) return { label: 'Error', cls: 'bad' };
+  if (g.in_sync === false) return { label: 'Applying…', cls: 'warn' };
+  return { label: 'Online', cls: 'ok' };
+}
+
+const siteName = (id) => { const s = ((S.status && S.status.sites) || []).find((x) => x.id === id); return s ? s.name : id; };
+
+function siteCard(site) {
+  const g = site.gateway, st = gatewayState(g);
+  const tunnels = !g.enrolled
+    ? [h('span', { class: 'sub' }, g.enrol_pending_until ? 'shown once the gateway connects' : '—')]
+    : g.tunnels.length
+    ? g.tunnels.map((t) => h('div', { class: 'target', title: t.up ? 'Tunnel is up' : t.up === false ? 'No recent handshake' : 'Unknown while the gateway is offline' },
+      h('span', { class: 'dot ' + (t.up ? 'ok' : t.up === false ? 'bad' : '') }), h('span', null, t.edge_name),
+      t.handshake_age_secs != null && h('span', { class: 'sub' }, t.handshake_age_secs + 's')))
+    : [h('span', { class: 'sub' }, 'no edges with WireGuard yet')];
+  return h('div', { class: 'card site', 'data-id': site.id },
+    h('div', { class: 'cell' },
+      h('div', { class: 'name' }, site.name),
+      h('div', { class: 'chips' }, site.lan_cidrs.map((c) => h('span', { class: 'chip mono' }, c)))),
+    h('div', { class: 'cell' },
+      h('span', { class: 'label' }, 'Gateway'),
+      h('span', { class: 'badge ' + st.cls }, st.label),
+      g.error && h('div', { class: 'err' }, g.error),
+      g.enrolled && h('div', { class: 'sub' }, g.online ? `v${g.version || '?'} · seen ${ago(g.last_seen)}` : `last seen ${ago(g.last_seen)}`),
+      g.enrolled && g.tunnel_ip && h('div', { class: 'sub mono' }, 'tunnel ' + g.tunnel_ip),
+      !g.enrolled && g.enrol_pending_until && h('div', { class: 'sub' }, 'command expires in ' + inFuture(g.enrol_pending_until)),
+    ),
+    h('div', { class: 'cell' }, h('span', { class: 'label' }, 'Tunnels to edges'), h('div', { class: 'targets' }, tunnels)),
+    h('div', { class: 'cell' }, h('span', { class: 'label' }, 'Routes'), h('div', null, `${site.routes} route${site.routes === 1 ? '' : 's'}`)),
+    h('div', { class: 'row-actions' },
+      h('button', { class: 'small' + (g.enrolled ? '' : ' primary'), type: 'button', onclick: () => openEnrol(site) }, g.enrolled ? 'Re-enrol gateway' : 'Connect gateway'),
+      h('button', { class: 'small', type: 'button', onclick: () => openSiteDialog(site) }, 'Edit'),
+      h('button', { class: 'small danger', type: 'button', onclick: () => deleteSite(site) }, 'Delete')),
+  );
+}
+
+function renderSites(main) {
+  const sites = (S.status && S.status.sites) || [];
+  const add = () => openSiteDialog(null);
+  const noListener = S.status && !S.status.gateway_listener;
+  main.replaceChildren(...[
+    h('div', { class: 'page-head' }, h('h2', null, 'Sites'), h('button', { class: 'primary', type: 'button', onclick: add }, 'Add site')),
+    noListener ? h('p', { class: 'callout' }, 'Gateways can\'t connect yet. Start the controller with ',
+      h('code', null, '--gateway-listen 0.0.0.0:7444 --gateway-host <public hostname or IP>'), ' and make that port reachable from your gateway.') : null,
+    sites.length
+      ? h('div', { class: 'list' }, sites.map(siteCard))
+      : h('div', { class: 'empty' }, 'No sites yet. A site is a network behind a gateway, like your home LAN, that your edges can reach over WireGuard without opening any ports at home.',
+        h('div', null, h('button', { class: 'primary', type: 'button', onclick: add }, 'Add your first site'))),
+  ].filter(Boolean));
+}
+
+let editingSite = null;
+
+function openSiteDialog(site) {
+  editingSite = site;
+  $('#site-title').textContent = site ? 'Edit site' : 'Add a site';
+  $('#s-name').value = site ? site.name : '';
+  $('#s-cidrs').value = site ? site.lan_cidrs.join('\n') : '';
+  showErrors($('#site-errors'), []);
+  openDialog('#site-dialog');
+  $('#s-name').focus();
+}
+
+$('#site-cancel').addEventListener('click', () => $('#site-dialog').close());
+$('#site-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const name = $('#s-name').value.trim();
+  const lan_cidrs = $('#s-cidrs').value.split(/[\s,]+/).filter(Boolean);
+  const errs = [];
+  if (!name) errs.push('Name is required');
+  if (!lan_cidrs.length) errs.push('Add at least one LAN range, such as 192.168.1.0/24');
+  if (errs.length) return showErrors($('#site-errors'), errs);
+  $('#site-save').disabled = true;
+  try {
+    if (editingSite) await api('PUT', '/sites/' + encodeURIComponent(editingSite.id), { name, lan_cidrs });
+    else await api('POST', '/sites', { name, lan_cidrs });
+    $('#site-dialog').close();
+    refresh();
+  } catch (e) {
+    if (e.status !== 401) showErrors($('#site-errors'), e.lines);
+  } finally {
+    $('#site-save').disabled = false;
+  }
+});
+
+function deleteSite(site) {
+  confirmDialog({
+    title: `Delete site ${site.name}?`,
+    body: 'Edges stop tunnelling to it. A site that routes still use can\'t be deleted. The gateway machine is left as it is: stop its edge-lb-gateway service when you no longer need it.',
+    typeName: site.name,
+    run: () => api('DELETE', '/sites/' + encodeURIComponent(site.id)),
+  });
+}
+
+async function openEnrol(site) {
+  $('#enrol-title').textContent = `Connect a gateway for ${site.name}`;
+  $('#enrol-cmd').textContent = '';
+  $('#enrol-note').textContent = '';
+  showErrors($('#enrol-errors'), []);
+  openDialog('#enrol-dialog');
+  try {
+    const r = await api('POST', `/sites/${encodeURIComponent(site.id)}/enrol`);
+    $('#enrol-cmd').textContent = r.command;
+    $('#enrol-note').textContent = `One-time command, valid until ${clock(r.expires)}. It pins this controller's certificate, installs the gateway, and enrols it. Running it again later with a new command replaces the gateway.`;
+  } catch (e) {
+    if (e.status !== 401) showErrors($('#enrol-errors'), e.lines);
+  }
+}
+
+$('#enrol-close').addEventListener('click', () => { $('#enrol-dialog').close(); refresh(); });
+$('#enrol-copy').addEventListener('click', async () => {
+  const text = $('#enrol-cmd').textContent;
+  if (!text) return;
+  try { await navigator.clipboard.writeText(text); toast('Copied'); } catch (_) { toast('Select the text and copy it'); }
+});
+
 // ---- routes page -------------------------------------------------------------------------
 
 function applicableEdges(r) {
@@ -434,7 +579,8 @@ function routeCard(c) {
     h('div', { class: 'cell' }, h('span', { class: 'label' }, 'Listen'), h('div', { class: 'mono' }, addr(c.listen.ip, c.listen.port)),
       c.proxy_protocol && h('div', { class: 'chips' }, h('span', { class: 'chip flag' }, 'PROXY v2'))),
     h('div', { class: 'cell' }, h('span', { class: 'label' }, 'Targets'),
-      h('div', { class: 'targets' }, c.targets.map((t) => h('div', { class: 'target mono' }, addr(t.address, t.port))))),
+      h('div', { class: 'targets' }, c.targets.map((t) => h('div', { class: 'target mono' }, addr(t.address, t.port)))),
+      c.site && h('div', { class: 'chips' }, h('span', { class: 'chip flag', title: 'Sent through this site\'s WireGuard gateway' }, 'via ' + siteName(c.site)))),
     h('div', { class: 'cell' }, h('span', { class: 'label' }, c.edges.length ? 'Runs on' : 'Runs on (all edges)'),
       h('div', { class: 'targets' }, edges.length ? edges.map((e) => routeOnEdge(c, e)) : h('span', { class: 'sub' }, 'no edges'))),
     h('div', { class: 'row-actions' },
@@ -456,7 +602,7 @@ function renderRoutes(main) {
   );
 }
 
-const routeBody = (c) => ({ id: c.id, name: c.name, enabled: c.enabled, listen: c.listen, domains: c.domains, targets: c.targets, proxy_protocol: c.proxy_protocol, edges: c.edges });
+const routeBody = (c) => ({ id: c.id, name: c.name, enabled: c.enabled, listen: c.listen, domains: c.domains, targets: c.targets, proxy_protocol: c.proxy_protocol, edges: c.edges, site: c.site || null });
 
 async function toggleRoute(c) {
   try { await api('PUT', '/routes/' + encodeURIComponent(c.id), { ...routeBody(c), enabled: !c.enabled }); } catch (e) { alert(e.lines.join('\n')); }
@@ -503,6 +649,9 @@ function openRouteDialog(c) {
   $('#r-targets').value = c ? c.targets.map((t) => addr(t.address, t.port)).join('\n') : '';
   $('#r-proxy').checked = c ? c.proxy_protocol : false;
   $('#r-enabled').checked = c ? c.enabled : true;
+  const sites = (S.status && S.status.sites) || [];
+  $('#r-site').replaceChildren(h('option', { value: '' }, 'None (targets reachable from the edge)'), ...sites.map((x) => h('option', { value: x.id }, `${x.name} (${x.lan_cidrs.join(', ')})`)));
+  $('#r-site').value = c && c.site ? c.site : '';
   const scoped = c && c.edges.length > 0;
   document.querySelector(`input[name=scope][value=${scoped ? 'some' : 'all'}]`).checked = true;
   const edges = S.status.edges.filter((e) => e.status !== 'deleting');
@@ -536,7 +685,7 @@ $('#route-form').addEventListener('submit', async (ev) => {
     name, enabled: $('#r-enabled').checked, edges,
     listen: { ip: $('#r-ip').value.trim() || '0.0.0.0', port },
     domains: $('#r-domains').value.split(/[\s,]+/).filter(Boolean),
-    targets, proxy_protocol: $('#r-proxy').checked,
+    targets, proxy_protocol: $('#r-proxy').checked, site: $('#r-site').value || null,
   };
   $('#route-save').disabled = true;
   try {
@@ -594,6 +743,14 @@ async function renderSettings(main) {
   const limSave = h('button', { class: 'primary', type: 'button' }, 'Save');
   limSave.addEventListener('click', () => saveSection(limSave, limErr, { max_edges: Number(maxE.value), drain_seconds: Number(drain.value) }));
 
+  // WireGuard tunnels
+  const hasSites = ((S.status && S.status.sites) || []).length > 0;
+  const wgNet = h('input', { value: st.wg_network, spellcheck: 'false', disabled: hasSites });
+  const wgPort = h('input', { value: st.wg_port, inputmode: 'numeric' });
+  const wgErr = h('ul', { class: 'errors', hidden: true });
+  const wgSave = h('button', { class: 'primary', type: 'button' }, 'Save');
+  wgSave.addEventListener('click', () => saveSection(wgSave, wgErr, { wg_network: hasSites ? undefined : wgNet.value.trim(), wg_port: Number(wgPort.value) }));
+
   // DNS
   const d = st.dns;
   const cfTok = h('input', { type: 'password', autocomplete: 'off', placeholder: d && d.token_set ? '•••••••• (set; leave blank to keep)' : 'Cloudflare API token (Zone · DNS · Edit)' });
@@ -620,6 +777,10 @@ async function renderSettings(main) {
     sectionForm('Limits', 'Every edge is a billed server. These guard against runaway costs and abrupt deletions.',
       [field('Maximum edges', maxE), field('Drain time (seconds)', drain, 'How long a deleted edge keeps serving existing connections. Set this at least as long as your DNS TTL.'), limErr],
       h('div', { class: 'buttons' }, limSave)),
+    sectionForm('WireGuard tunnels', 'Edges and site gateways talk over private WireGuard tunnels inside this network. Every node gets an address from it.',
+      [field('Tunnel network', wgNet, hasSites ? 'Fixed while sites exist, because every tunnel address would change.' : 'A private range between /16 and /27. It must not overlap any site\'s LAN ranges.'),
+        field('Edge UDP port', wgPort, 'Each edge listens here for its gateways, so allow it in the provider firewall.'), wgErr],
+      h('div', { class: 'buttons' }, wgSave)),
     sectionForm('DNS (Cloudflare)', 'Names listed here are pointed at every healthy edge, and unhealthy edges are removed. Only records created by edge-lb are ever changed. Records are DNS-only (never proxied), which TLS passthrough needs.',
       [field('API token', cfTok), field('Zone ID', zone), field('Names', names, 'One fully-qualified name per line.'), field('TTL (seconds)', ttl, '1 = automatic, otherwise 60–86400.'), dnsErr],
       h('div', { class: 'buttons' }, dnsSave, dnsOff)),

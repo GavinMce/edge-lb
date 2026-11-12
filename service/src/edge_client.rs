@@ -58,11 +58,11 @@ impl EdgeClient {
         self.get("/v1/status").await
     }
 
-    pub async fn put_config(&self, generation: u64, routes: &[Route]) -> Result<(), ClientError> {
+    pub async fn put_config(&self, generation: u64, routes: &[Route], wg: Option<&crate::wg::Desired>) -> Result<(), ClientError> {
         let r = self
             .http
             .put(format!("{}/v1/config", self.base))
-            .json(&json!({ "generation": generation, "routes": routes }))
+            .json(&json!({ "generation": generation, "routes": routes, "wg": wg }))
             .send()
             .await
             .map_err(|e| ClientError::Other(chain(&e)))?;

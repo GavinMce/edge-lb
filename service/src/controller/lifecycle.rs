@@ -43,6 +43,7 @@ impl Controller {
     }
 
     fn tick(self: &Arc<Self>) {
+        self.ensure_addresses();
         let ids: Vec<String> = self.store.read(|s| s.edges.iter().map(|e| e.id.clone()).collect());
         for id in ids {
             if !self.inflight.lock().unwrap().insert(id.clone()) {
@@ -262,8 +263,10 @@ impl Controller {
                     self.mutate(&e.id, |x| {
                         x.mgmt_fingerprint = Some(fp.clone());
                         x.mgmt_port = done.mgmt_port;
+                        x.wg_public_key = done.wg_public_key.clone();
                     });
-                    self.transition(&e.id, EdgeStatus::Joining, &format!("installed; pinned identity {}", &fp[..16]));
+                    let wg_note = if done.wg_public_key.is_some() { "WireGuard ready" } else { "no WireGuard (gateway sites unavailable)" };
+                    self.transition(&e.id, EdgeStatus::Joining, &format!("installed; pinned identity {}; {wg_note}", &fp[..16]));
                 }
                 Err(err) => self.fail(&e.id, &format!("edge returned an unusable identity: {err:#}")),
             },
@@ -276,12 +279,13 @@ impl Controller {
             Ok(c) => c,
             Err(err) => return self.fail(&e.id, &err.to_string()),
         };
-        let (routes, hash, gen) = self.store.read(|s| {
+        let (routes, wg, hash, gen) = self.store.read(|s| {
             let r = s.routes_for(&e.id);
-            let h = routes_hash(&r);
-            (r, h, s.generation)
+            let w = s.edge(&e.id).and_then(|x| s.wg_for_edge(x));
+            let h = config_hash(&r, &w);
+            (r, w, h, s.generation)
         });
-        match client.put_config(gen, &routes).await {
+        match client.put_config(gen, &routes, wg.as_ref()).await {
             Ok(()) => {
                 self.mutate(&e.id, |x| x.applied_hash = Some(hash));
                 self.transition(&e.id, EdgeStatus::Healthy, &format!("joined; serving {} route(s)", routes.len()));
@@ -300,10 +304,11 @@ impl Controller {
             Ok(c) => c,
             Err(err) => return self.fail(&e.id, &err.to_string()),
         };
-        let (routes, desired, gen) = self.store.read(|s| {
+        let (routes, wg, desired, gen) = self.store.read(|s| {
             let r = s.routes_for(&e.id);
-            let h = routes_hash(&r);
-            (r, h, s.generation)
+            let w = s.edge(&e.id).and_then(|x| s.wg_for_edge(x));
+            let h = config_hash(&r, &w);
+            (r, w, h, s.generation)
         });
         let due = self.live.read().unwrap().get(&e.id).and_then(|l| l.last_poll).is_none_or(|t| t.elapsed() >= self.opts.poll_every);
         let needs_push = e.applied_hash.as_deref() != Some(desired.as_str());
@@ -313,12 +318,12 @@ impl Controller {
         }
 
         if needs_push {
-            match client.put_config(gen, &routes).await {
+            match client.put_config(gen, &routes, wg.as_ref()).await {
                 Ok(()) => {
                     self.mutate(&e.id, |x| {
                         x.applied_hash = Some(desired.clone());
                         x.error = None;
-                        push_log(x, &format!("applied {} route(s)", routes.len()));
+                        push_log(x, &format!("applied {} route(s){}", routes.len(), wg.as_ref().map(|w| format!(", {} tunnel peer(s)", w.peers.len())).unwrap_or_default()));
                     });
                 }
                 Err(ClientError::Rejected(d)) => {

@@ -191,7 +191,7 @@ impl Bootstrapper for Machines {
             anyhow::bail!(m);
         }
         let h = start_edge(&self.dir.join(&t.edge_id), SocketAddr::new(t.ip, 0), &ctx.ca_pem).await;
-        let out = Installed { cert_pem: h.cert_pem.clone(), mgmt_port: h.addr.port() };
+        let out = Installed { cert_pem: h.cert_pem.clone(), mgmt_port: h.addr.port(), wg_public_key: None };
         self.edges.lock().await.insert(t.edge_id.clone(), h);
         Ok(out)
     }
@@ -320,7 +320,7 @@ fn croute(name: &str, ip: &str, port: u16, target: u16, edges: &[&str]) -> edge_
         "name": name, "listen": {"ip": ip, "port": port}, "targets": [{"address": "127.0.0.1", "port": target}]
     }))
     .unwrap();
-    edge_lbd::controller::model::CRoute { route, edges: edges.iter().map(|s| s.to_string()).collect() }
+    edge_lbd::controller::model::CRoute { route, edges: edges.iter().map(|s| s.to_string()).collect(), site: None }
 }
 
 async fn fetch(addr: SocketAddr) -> String {

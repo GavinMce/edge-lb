@@ -57,6 +57,10 @@ struct EdgeState {
 pub struct ConfigPush {
     pub generation: u64,
     pub routes: Vec<Route>,
+    /// WireGuard state for this edge. Absent from controllers that predate gateways; absent also
+    /// when the edge has no WireGuard, in which case any previous state is left untouched.
+    #[serde(default)]
+    pub wg: Option<crate::wg::Desired>,
 }
 
 #[derive(Serialize)]
@@ -128,9 +132,27 @@ async fn status(State(s): State<Arc<EdgeState>>) -> Json<StatusResp> {
     Json(StatusResp { generation: *s.generation.lock().await, status: s.engine.status().await })
 }
 
+/// Hand the validated WireGuard state to the root applier by writing it where that daemon looks.
+/// The edge itself has no privileges and never touches the interface.
+fn write_wg_state(dir: &Path, wg: &crate::wg::Desired) -> Result<()> {
+    let tmp = dir.join("wg.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(wg)?)?;
+    std::fs::rename(&tmp, dir.join("wg.json"))?;
+    Ok(())
+}
+
 async fn put_config(State(s): State<Arc<EdgeState>>, Json(push): Json<ConfigPush>) -> Result<Json<serde_json::Value>, ApiError> {
     let mut gen = s.generation.lock().await;
+    if let Some(wg) = &push.wg {
+        crate::wg::validate(wg).map_err(|e| ApiError::from(crate::engine::EngineError::Invalid(e)))?;
+        if !wg.forward_to.is_empty() {
+            return Err(crate::engine::EngineError::Invalid(vec!["an edge may not forward traffic".into()]).into());
+        }
+    }
     let applied = s.engine.replace_all(push.routes).await?;
+    if let Some(wg) = &push.wg {
+        write_wg_state(&s.data_dir, wg).map_err(|e| ApiError::from(crate::engine::EngineError::Internal(format!("saving WireGuard state: {e:#}"))))?;
+    }
     *gen = push.generation;
     let _ = std::fs::write(s.data_dir.join("generation"), gen.to_string());
     Ok(Json(serde_json::json!({ "generation": *gen, "routes": applied.len() })))

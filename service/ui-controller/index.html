@@ -12,6 +12,7 @@
   <div class="brand"><h1>edge-lb</h1><span id="conn" class="dot" title="Connection to the controller"></span></div>
   <nav class="tabs" id="tabs">
     <a href="#/edges" data-tab="edges">Edges</a>
+    <a href="#/sites" data-tab="sites">Sites</a>
     <a href="#/routes" data-tab="routes">Routes</a>
     <a href="#/settings" data-tab="settings">Settings</a>
     <a href="#/activity" data-tab="activity">Activity</a>
@@ -85,7 +86,9 @@
     <label class="field"><span>Domains <em>(optional)</em></span><textarea id="r-domains" rows="2" spellcheck="false" placeholder="example.com&#10;*.example.com"></textarea>
       <small>One per line. Matched on TLS SNI, HTTP Host, or the Minecraft server address. Empty = everything on this port.</small></label>
     <label class="field"><span>Targets</span><textarea id="r-targets" required rows="3" spellcheck="false" placeholder="10.100.0.2:443"></textarea>
-      <small>One <code>ip:port</code> per line. Several targets are balanced round-robin; unhealthy ones are skipped. They must be reachable <em>from the edge</em>.</small></label>
+      <small>One <code>ip:port</code> per line. Several targets are balanced round-robin; unhealthy ones are skipped. They must be reachable <em>from the edge</em>, or inside the site you pick below.</small></label>
+    <label class="field"><span>Site <em>(optional)</em></span><select id="r-site"></select>
+      <small>Pick a site when the targets are on its network (your home LAN, say). Traffic then goes through that site's WireGuard gateway, and every target must be inside the site's ranges. Leave it on "None" for targets the edge can reach directly.</small></label>
     <fieldset class="field scope"><legend>Runs on</legend>
       <label class="check"><input type="radio" name="scope" value="all" checked> All edges <small>(including ones added later)</small></label>
       <label class="check"><input type="radio" name="scope" value="some"> Selected edges</label>
@@ -97,6 +100,30 @@
     </div>
     <ul id="route-errors" class="errors" hidden></ul>
     <div class="buttons"><button type="button" class="ghost" id="route-cancel">Cancel</button><button type="submit" class="primary" id="route-save">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="site-dialog">
+  <form id="site-form" method="dialog" novalidate>
+    <h2 id="site-title">Add a site</h2>
+    <p class="hint">A site is a private network your edges can reach through a WireGuard gateway, such as your home LAN. The gateway dials out to the edges, so CGNAT and closed router ports don't matter.</p>
+    <label class="field"><span>Name</span><input id="s-name" required maxlength="60" placeholder="Home" autocomplete="off"></label>
+    <label class="field"><span>LAN ranges</span><textarea id="s-cidrs" required rows="2" spellcheck="false" placeholder="192.168.1.0/24"></textarea>
+      <small>One per line. These are the only addresses the edges can reach through this site; everything else arriving from the tunnel is dropped at the gateway.</small></label>
+    <ul id="site-errors" class="errors" hidden></ul>
+    <div class="buttons"><button type="button" class="ghost" id="site-cancel">Cancel</button><button type="submit" class="primary" id="site-save">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="enrol-dialog">
+  <form id="enrol-form" method="dialog">
+    <h2 id="enrol-title">Connect a gateway</h2>
+    <p class="hint">Run this as a user with <code>sudo</code> on a small always-on Linux machine on that network: a VM, a privileged container, or a Pi. It needs kernel WireGuard and the same CPU architecture as the controller.</p>
+    <ul id="enrol-errors" class="errors" hidden></ul>
+    <pre class="code" id="enrol-cmd"></pre>
+    <div class="buttons start"><button type="button" class="ghost small" id="enrol-copy">Copy command</button></div>
+    <p class="hint" id="enrol-note"></p>
+    <div class="buttons"><button type="button" class="primary" id="enrol-close">Done</button></div>
   </form>
 </dialog>
 

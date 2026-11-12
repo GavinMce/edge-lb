@@ -29,6 +29,42 @@ enum Cmd {
     Edge(EdgeArgs),
     /// Single machine: proxy and web UI together, no controller.
     Standalone(StandaloneArgs),
+    /// Run as a site's WireGuard gateway on the home network (installed by the controller's enrol command).
+    Gateway(GatewayArgs),
+    /// Root helper on an edge: applies the WireGuard state the edge writes. Installed by the controller.
+    WgApply(WgApplyArgs),
+}
+
+#[derive(Parser, Debug)]
+struct GatewayArgs {
+    /// The controller's gateway listener, as host:port.
+    #[arg(long)]
+    controller: String,
+
+    /// SHA-256 fingerprint (hex) of the controller's gateway certificate.
+    #[arg(long)]
+    pin: String,
+
+    /// Holds the WireGuard key, enrolment token and identity. Root only.
+    #[arg(long, default_value = "/var/lib/edge-lb-gateway")]
+    data_dir: PathBuf,
+
+    #[arg(long, default_value_t = 5)]
+    interval_secs: u64,
+}
+
+#[derive(Parser, Debug)]
+struct WgApplyArgs {
+    /// State file the edge process writes (validated JSON).
+    #[arg(long, default_value = "/var/lib/edge-lb/wg.json")]
+    state: PathBuf,
+
+    /// The edge's WireGuard private key (root only).
+    #[arg(long, default_value = "/etc/edge-lb/wg.key")]
+    key: PathBuf,
+
+    #[arg(long, default_value_t = 2000)]
+    interval_ms: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -54,6 +90,15 @@ struct ControllerArgs {
     /// target's OS and CPU; a static (musl) build runs anywhere.
     #[arg(long, env = "EDGE_LB_EDGE_BINARY")]
     edge_binary: Option<PathBuf>,
+
+    /// Where WireGuard gateways connect (TLS, pinned by them; only enrolment and sync live here).
+    /// Off unless set. Typically 0.0.0.0:7444 on a public machine.
+    #[arg(long, env = "EDGE_LB_GATEWAY_LISTEN", requires = "gateway_host")]
+    gateway_listen: Option<SocketAddr>,
+
+    /// The hostname or IPv4 address gateways use to reach --gateway-listen (host or host:port).
+    #[arg(long, env = "EDGE_LB_GATEWAY_HOST")]
+    gateway_host: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -254,6 +299,9 @@ async fn controller(args: ControllerArgs) -> Result<()> {
     if let Some(b) = args.edge_binary {
         opts.edge_binary = b;
     }
+    if let (Some(listen), Some(host)) = (args.gateway_listen, args.gateway_host) {
+        opts.gateway = Some(edge_lbd::controller::sites::GatewayListen { listen, host });
+    }
     let ctl = edge_lbd::controller::Controller::start(opts).await?;
     if let Some(code) = ctl.setup_code.lock().unwrap().clone() {
         info!("FIRST RUN: open the UI and create the admin account with setup code {code}");
@@ -268,6 +316,34 @@ async fn controller(args: ControllerArgs) -> Result<()> {
     Ok(())
 }
 
+async fn gateway(args: GatewayArgs) -> Result<()> {
+    if !edge_lbd::gateway::valid_pin(&args.pin) {
+        bail!("--pin must be the 64-character hex SHA-256 fingerprint of the controller's gateway certificate");
+    }
+    if !edge_lbd::controller::sites::valid_hostport(&args.controller) {
+        bail!("--controller must be host:port");
+    }
+    let run = edge_lbd::gateway::run(edge_lbd::gateway::Options {
+        controller: args.controller,
+        pin: args.pin,
+        data_dir: args.data_dir,
+        interval: Duration::from_secs(args.interval_secs.clamp(1, 300)),
+        host: Arc::new(edge_lbd::gateway::RealHost),
+    });
+    tokio::select! {
+        r = run => r,
+        _ = shutdown_signal() => Ok(()),
+    }
+}
+
+async fn wg_apply(args: WgApplyArgs) -> Result<()> {
+    info!("watching {} and keeping {} in step with it", args.state.display(), edge_lbd::wg::IFACE);
+    tokio::select! {
+        r = edge_lbd::wg::watch_and_apply(&args.state, &args.key, Duration::from_millis(args.interval_ms.max(200))) => r,
+        _ = shutdown_signal() => Ok(()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -277,5 +353,7 @@ async fn main() -> Result<()> {
         Cmd::Controller(a) => controller(a).await,
         Cmd::Edge(a) => edge(a).await,
         Cmd::Standalone(a) => standalone(a).await,
+        Cmd::Gateway(a) => gateway(a).await,
+        Cmd::WgApply(a) => wg_apply(a).await,
     }
 }

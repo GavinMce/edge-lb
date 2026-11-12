@@ -41,6 +41,18 @@ pub fn edge_server_config(cert_pem: &str, key_pem: &str, controller_ca_pem: &str
     Ok(Arc::new(cfg))
 }
 
+/// Controller side, for gateways: present the controller's self-signed certificate and require no
+/// client certificate (a gateway proves itself with a one-time token, then a secret). Gateways pin
+/// this certificate, so there is no public CA involved.
+pub fn gateway_server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>> {
+    let mut cfg = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(pki::certs_from_pem(cert_pem)?, pki::key_from_pem(key_pem)?)?;
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
 /// Accepts exactly one server certificate: the one whose SHA-256 matches the pin.
 /// Handshake signatures are still verified, so possession of the private key is proven.
 #[derive(Debug)]
@@ -107,8 +119,8 @@ pub fn pinned_client_config(
     Ok(cfg)
 }
 
-/// A client that pins the edge but presents NO client certificate. Test helper only.
-#[doc(hidden)]
+/// A client that pins the server's certificate but presents NO client certificate: what a gateway
+/// uses to talk to the controller.
 pub fn pinned_client_config_no_auth(pinned_fingerprint: &str) -> Result<ClientConfig> {
     let p = provider();
     let mut cfg = ClientConfig::builder_with_provider(p.clone())

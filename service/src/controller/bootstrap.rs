@@ -33,6 +33,8 @@ pub struct InstallCtx {
 pub struct Installed {
     pub cert_pem: String,
     pub mgmt_port: u16,
+    /// The edge's WireGuard public key, if WireGuard could be set up on the machine.
+    pub wg_public_key: Option<String>,
 }
 
 #[async_trait]
@@ -81,6 +83,8 @@ impl SshKey {
 
 const MARK_BEGIN: &str = "-----BEGIN EDGE-LB IDENTITY-----";
 const MARK_END: &str = "-----END EDGE-LB IDENTITY-----";
+const WG_BEGIN: &str = "-----BEGIN EDGE-LB WIREGUARD-----";
+const WG_END: &str = "-----END EDGE-LB WIREGUARD-----";
 
 const INSTALL_SH: &str = r#"#!/bin/sh
 # edge-lb installer. Pushed by the controller over SSH. Idempotent.
@@ -146,9 +150,68 @@ if ! systemctl is-active --quiet edge-lbd || [ ! -s "$CERT" ]; then
   exit 1
 fi
 rm -rf "$UP"
+
+# --- WireGuard (only used once a gateway site exists). Best effort: a machine without it still
+# serves direct routes. The private key is generated here and never leaves the machine.
+WGPUB=''
+setup_wg() {
+  if ! command -v wg >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools >/dev/null 2>&1 || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y -q wireguard-tools >/dev/null 2>&1 || return 1
+    else
+      return 1
+    fi
+  fi
+  command -v ip >/dev/null 2>&1 || return 1
+  modprobe wireguard >/dev/null 2>&1 || true
+  ip link add edgelb-probe type wireguard >/dev/null 2>&1 || return 1
+  ip link del edgelb-probe >/dev/null 2>&1 || true
+  ( umask 077; [ -s /etc/edge-lb/wg.key ] || wg genkey > /etc/edge-lb/wg.key )
+  chmod 600 /etc/edge-lb/wg.key
+  WGPUB=$(wg pubkey < /etc/edge-lb/wg.key) || return 1
+  cat > /etc/systemd/system/edge-lb-wg.service <<'UNIT'
+[Unit]
+Description=edge-lb WireGuard applier
+After=network-online.target edge-lbd.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/edge-lbd wg-apply --state /var/lib/edge-lb/wg.json --key /etc/edge-lb/wg.key
+Restart=always
+RestartSec=2
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable edge-lb-wg >/dev/null 2>&1
+  systemctl restart edge-lb-wg
+}
+if ! setup_wg; then
+  WGPUB=''
+  log "WireGuard is not available here: this edge can serve direct routes but not gateway sites"
+fi
+
 echo '@BEGIN@'
 cat "$CERT"
 echo '@END@'
+if [ -n "$WGPUB" ]; then
+  echo '@WGBEGIN@'
+  echo "$WGPUB"
+  echo '@WGEND@'
+fi
 "#;
 
 /// Same flow without root or systemd: installs under a scratch directory and runs the edge as
@@ -176,8 +239,10 @@ echo '@END@'
 
 const UNINSTALL_SH: &str = r#"#!/bin/sh
 set -u
+systemctl disable --now edge-lb-wg >/dev/null 2>&1 || true
+ip link del wg-edge >/dev/null 2>&1 || true
 systemctl disable --now edge-lbd >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/edge-lbd.service /usr/local/bin/edge-lbd
+rm -f /etc/systemd/system/edge-lb-wg.service /etc/systemd/system/edge-lbd.service /usr/local/bin/edge-lbd
 rm -rf /etc/edge-lb /var/lib/edge-lb /var/lib/private/edge-lb
 systemctl daemon-reload >/dev/null 2>&1 || true
 "#;
@@ -199,7 +264,9 @@ pub fn install_script(upload_dir: &str, mgmt_port: u16, stage: Option<&Path>) ->
         .replace("@UP@", upload_dir)
         .replace("@PORT@", &mgmt_port.to_string())
         .replace("@BEGIN@", MARK_BEGIN)
-        .replace("@END@", MARK_END);
+        .replace("@END@", MARK_END)
+        .replace("@WGBEGIN@", WG_BEGIN)
+        .replace("@WGEND@", WG_END);
     if let Some(st) = stage {
         s = s.replace("@STAGE@", &shell_safe(st)?);
     }
@@ -243,6 +310,15 @@ pub fn extract_identity(stdout: &str) -> Result<String> {
         bail!("expected exactly one certificate from the edge, got {}", certs.len());
     }
     Ok(pem + "\n")
+}
+
+/// The edge's WireGuard public key, if the installer reported one. It comes from the remote
+/// machine, so it is accepted only if it is exactly a well-formed key.
+pub fn extract_wg_key(stdout: &str) -> Option<String> {
+    let start = stdout.find(WG_BEGIN)? + WG_BEGIN.len();
+    let end = stdout[start..].find(WG_END)? + start;
+    let key = stdout[start..end].trim();
+    crate::wg::is_key(key).then(|| key.to_string())
 }
 
 // ---- the real thing ----------------------------------------------------------------------------
@@ -325,7 +401,7 @@ impl Bootstrapper for SshBootstrapper {
         self.ssh(t, &format!("cat > {dir}/ca.pem"), Input::Bytes(ctx.ca_pem.clone().into_bytes()), Duration::from_secs(30)).await?;
         let script = install_script(&dir, t.mgmt_port, self.stage.as_deref())?;
         let out = self.ssh(t, &format!("{}sh -s", Self::sudo(t)), Input::Bytes(script.into_bytes()), Duration::from_secs(180)).await.context("running the installer")?;
-        Ok(Installed { cert_pem: extract_identity(&out)?, mgmt_port: t.mgmt_port })
+        Ok(Installed { cert_pem: extract_identity(&out)?, mgmt_port: t.mgmt_port, wg_public_key: extract_wg_key(&out) })
     }
 
     async fn uninstall(&self, t: &Target) -> Result<()> {
@@ -361,6 +437,23 @@ mod tests {
         assert!(prod.contains("edge --mgmt 0.0.0.0:7443"));
         assert!(prod.contains("DynamicUser=yes") && prod.contains("NoNewPrivileges=yes"));
         assert!(prod.contains("/tmp/edge-lb.AbC123xyz9"));
+        // WireGuard: the root applier is its own unit with a narrow capability set, and the
+        // edge's own unit stays unprivileged.
+        assert!(prod.contains("edge-lbd wg-apply --state /var/lib/edge-lb/wg.json --key /etc/edge-lb/wg.key"));
+        assert!(prod.contains("CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH"));
+        assert!(prod.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
+        assert!(!staged.contains("wg-apply"), "the test installer needs no root or WireGuard");
+    }
+
+    #[test]
+    fn wireguard_key_extraction_trusts_nothing() {
+        let key = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
+        assert_eq!(extract_wg_key(&format!("x\n{WG_BEGIN}\n{key}\n{WG_END}\n")).as_deref(), Some(key));
+        assert_eq!(extract_wg_key("no block"), None);
+        assert_eq!(extract_wg_key(&format!("{WG_BEGIN}\n{key}")), None, "truncated");
+        for bad in ["", "short", "abc\nPostUp = rm -rf /", &format!("{key}\n{key}")] {
+            assert_eq!(extract_wg_key(&format!("{WG_BEGIN}\n{bad}\n{WG_END}")), None, "{bad:?}");
+        }
     }
 
     #[test]
