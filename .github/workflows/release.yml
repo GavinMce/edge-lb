@@ -1,0 +1,68 @@
+name: Release
+
+# Push a tag like v0.1.0 to build a static binary and publish it as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build static ${{ matrix.arch }} binary
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: service
+          key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Test
+        working-directory: service
+        run: cargo test --locked
+      - name: Build
+        working-directory: service
+        env:
+          CC_x86_64_unknown_linux_musl: gcc
+          CC_aarch64_unknown_linux_musl: gcc
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="edge-lbd-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
+          mkdir "$name"
+          cp service/target/${{ matrix.target }}/release/edge-lbd "$name/"
+          cp service/deploy/edge-lbd.service README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: edge-lbd-*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes
