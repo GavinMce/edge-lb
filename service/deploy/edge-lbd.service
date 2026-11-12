@@ -1,0 +1,40 @@
+[Unit]
+Description=edge-lb standalone (single-machine proxy + web UI)
+Documentation=file:///usr/local/share/doc/edge-lb/README.md
+After=network-online.target wg-quick@wg-edge.service
+Wants=network-online.target wg-quick@wg-edge.service
+
+[Service]
+# UI/API on the WireGuard address only. Token is created on first start in the state dir:
+#   sudo cat /var/lib/private/edge-lb/token
+ExecStart=/usr/local/bin/edge-lbd standalone \
+  --api 10.100.0.1:9090 \
+  --data-dir /var/lib/edge-lb \
+  --token-file /var/lib/edge-lb/token \
+  --nft-set inet:edge_lb:routes
+Restart=on-failure
+RestartSec=2
+
+DynamicUser=yes
+StateDirectory=edge-lb
+StateDirectoryMode=0700
+# Bind low ports; edit the nftables set (only needed with --nft-set).
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,70 @@
+global
+    log /dev/log local0
+    maxconn 4096
+    user haproxy
+    group haproxy
+
+defaults
+    log global
+    timeout connect 5s
+    timeout client  60s
+    timeout server  60s
+    timeout client-fin 10s
+
+# ---- 443: TLS passthrough, routed on SNI -----------------------------------
+frontend https_in
+    mode tcp
+    option tcplog
+    bind ${bind_addr}:443${bind_opts}
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+%{ for name, b in http_backends ~}
+%{ for h in b.hosts ~}
+    use_backend https_${name} if { req_ssl_sni -i ${h} }
+%{ endfor ~}
+%{ endfor ~}
+    default_backend reject
+
+# ---- 80: HTTP, routed on Host (ACME http-01 + redirect are the backend's job) -
+frontend http_in
+    mode http
+    option httplog
+    bind ${bind_addr}:80${bind_opts}
+%{ for name, b in http_backends ~}
+%{ for h in b.hosts ~}
+    use_backend http_${name} if { hdr(host) -i ${h} }
+%{ endfor ~}
+%{ endfor ~}
+    default_backend reject_http
+
+backend reject
+    mode tcp
+
+backend reject_http
+    mode http
+    http-request deny deny_status 404
+
+%{ for name, b in http_backends ~}
+backend https_${name}
+    mode tcp
+    server home ${b.address}:${b.https_port}%{ if b.proxy_protocol } send-proxy-v2 check-send-proxy%{ endif } check inter 5s fall 3 rise 2
+
+backend http_${name}
+    mode http
+    option forwardfor
+    server home ${b.address}:${b.http_port}%{ if b.proxy_protocol } send-proxy-v2 check-send-proxy%{ endif } check inter 5s fall 3 rise 2
+
+%{ endfor ~}
+# ---- raw TCP services ---------------------------------------------------------
+%{ for name, s in tcp_services ~}
+frontend tcp_${name}
+    mode tcp
+    option tcplog
+    bind ${bind_addr}:${s.listen_port}${bind_opts}
+    default_backend tcp_${name}
+
+backend tcp_${name}
+    mode tcp
+    server home ${s.address}:${s.port}%{ if s.proxy_protocol } send-proxy-v2 check-send-proxy%{ endif } check inter 5s fall 3 rise 2
+
+%{ endfor ~}

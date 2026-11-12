@@ -1,0 +1,11 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+*.key
+# .terraform.lock.hcl is committed on purpose
+
+# Rust service build output
+service/target/

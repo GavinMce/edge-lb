@@ -1,0 +1,21 @@
+# /etc/wireguard/wg0.conf on the home gateway.
+# 1. wg genkey | tee /etc/wireguard/private.key | wg pubkey   -> give the pubkey to Terraform (home_peer.public_key)
+# 2. Fill in the two placeholders below.
+# 3. echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wg.conf && sysctl --system
+# 4. systemctl enable --now wg-quick@wg0
+[Interface]
+Address = ${home_wg_ip}/${wg_prefix}
+MTU = ${mtu}
+PrivateKey = <HOME_PRIVATE_KEY>
+
+# The edge proxies from its tunnel address, so LAN hosts would reply via your
+# router and the connection would break. Masquerade tunnel traffic onto the LAN.
+PostUp   = iptables -t nat -A POSTROUTING -s ${wg_network} -o <LAN_INTERFACE> -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -s ${wg_network} -o <LAN_INTERFACE> -j MASQUERADE
+
+[Peer]
+# edge
+PublicKey = <SERVER_PUBLIC_KEY>
+Endpoint = ${endpoint}
+AllowedIPs = ${wg_network}
+PersistentKeepalive = 25

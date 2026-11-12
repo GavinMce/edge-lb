@@ -1,0 +1,34 @@
+# Managed by edge-lb. Lives in its own table, so other firewall rules are left alone.
+# "add" then "delete" makes the reload atomic and idempotent.
+add table inet edge_lb
+delete table inet edge_lb
+
+table inet edge_lb {
+  chain input {
+    type filter hook input priority 0; policy drop;
+
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+
+    meta l4proto icmp accept
+    meta l4proto ipv6-icmp accept
+    udp dport { 68, 546 } accept comment "dhcp client"
+
+    tcp dport { 80, 443 } accept
+%{ for name, s in tcp_services ~}
+    tcp dport ${s.listen_port} accept comment "${name}"
+%{ endfor ~}
+    udp dport ${wg_port} accept
+
+    # SSH: always from inside the tunnel; from the public side only for admin CIDRs.
+    iifname "${wg_interface}" tcp dport ${ssh_port} accept
+%{ if length(ssh_cidrs4) > 0 ~}
+    ip saddr { ${join(", ", ssh_cidrs4)} } tcp dport ${ssh_port} accept
+%{ endif ~}
+%{ if length(ssh_cidrs6) > 0 ~}
+    ip6 saddr { ${join(", ", ssh_cidrs6)} } tcp dport ${ssh_port} accept
+%{ endif ~}
+  }
+  # No forward chain: HAProxy terminates and re-originates connections; the edge never routes.
+}

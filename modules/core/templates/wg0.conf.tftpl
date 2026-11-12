@@ -1,0 +1,18 @@
+[Interface]
+Address = ${server_wg_ip}/${wg_prefix}
+ListenPort = ${wg_port}
+MTU = ${mtu}
+# Replaced at first boot with a key generated on this machine.
+PrivateKey = __PRIVATE_KEY__
+
+[Peer]
+# home gateway
+PublicKey = ${home.public_key}
+AllowedIPs = ${join(", ", home_allowed)}
+%{ for name, p in extra_peers ~}
+
+[Peer]
+# ${name}
+PublicKey = ${p.public_key}
+AllowedIPs = ${p.wg_ip}/32
+%{ endfor ~}

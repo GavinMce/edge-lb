@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>edge-lb</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%232f5bea'/%3E%3Cpath d='M4 8h8M9 5l3 3-3 3' stroke='white' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top" id="top" hidden>
+  <div class="brand"><h1>edge-lb</h1><span id="conn" class="dot" title="Connection to the controller"></span></div>
+  <nav class="tabs" id="tabs">
+    <a href="#/edges" data-tab="edges">Edges</a>
+    <a href="#/routes" data-tab="routes">Routes</a>
+    <a href="#/settings" data-tab="settings">Settings</a>
+    <a href="#/activity" data-tab="activity">Activity</a>
+  </nav>
+  <div class="pills" id="pills"></div>
+  <div class="user"><span id="whoami" class="muted"></span><button id="btn-signout" class="ghost small" type="button">Sign out</button></div>
+</header>
+
+<main id="main"></main>
+
+<dialog id="auth">
+  <form id="auth-form" method="dialog">
+    <h2 id="auth-title">Sign in</h2>
+    <p id="auth-hint" class="hint"></p>
+    <label class="field" id="f-code-wrap" hidden><span>Setup code</span>
+      <input id="f-code" autocomplete="off" spellcheck="false" placeholder="from the controller's log">
+      <small>Printed when the controller first started, and stored in <code>setup-code</code> in its data directory.</small></label>
+    <label class="field"><span>Username</span><input id="f-user" autocomplete="username" required></label>
+    <label class="field"><span>Password</span><input id="f-pass" type="password" autocomplete="current-password" required>
+      <small id="f-pass-hint" hidden>At least 12 characters. A passphrase works well.</small></label>
+    <ul id="auth-errors" class="errors" hidden></ul>
+    <div class="buttons"><button type="submit" class="primary" id="auth-submit">Sign in</button></div>
+  </form>
+</dialog>
+
+<dialog id="edge-dialog">
+  <form id="edge-form" method="dialog" novalidate>
+    <h2>Add an edge</h2>
+    <div class="seg" id="edge-kind">
+      <label><input type="radio" name="kind" value="hetzner" checked> <span>New Hetzner server</span></label>
+      <label><input type="radio" name="kind" value="manual"> <span>Existing machine (SSH)</span></label>
+    </div>
+
+    <label class="field"><span>Name</span><input id="e-name" required maxlength="60" placeholder="US East" autocomplete="off"></label>
+    <label class="field"><span>Region label <em>(optional)</em></span><input id="e-region" maxlength="40" placeholder="us-east" autocomplete="off"><small>Just a label for your own reference.</small></label>
+
+    <section id="e-hetzner">
+      <p id="e-notoken" class="callout" hidden>Add your Hetzner API token in <a href="#/settings" id="e-goto-settings">Settings</a> first.</p>
+      <div class="row">
+        <label class="field grow"><span>Location</span><select id="e-location"></select></label>
+        <label class="field grow"><span>Server type</span><select id="e-type"></select></label>
+      </div>
+      <p id="e-cost" class="cost"></p>
+    </section>
+
+    <section id="e-manual" hidden>
+      <div class="row">
+        <label class="field grow"><span>IP address</span><input id="e-ip" placeholder="203.0.113.10" autocomplete="off" spellcheck="false"></label>
+        <label class="field port"><span>SSH port</span><input id="e-sshport" value="22" inputmode="numeric"></label>
+        <label class="field user"><span>SSH user</span><input id="e-sshuser" value="root" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <p class="hint">The controller logs in with its own key. Authorize it on that machine first:</p>
+      <pre class="code" id="e-key"></pre>
+      <button type="button" class="ghost small" id="e-copy">Copy command</button>
+      <p class="hint">Needs systemd and either root or passwordless <code>sudo</code>. The machine must be reachable on TCP <code id="e-mgmt-port">7443</code> from here.</p>
+    </section>
+
+    <ul id="edge-errors" class="errors" hidden></ul>
+    <div class="buttons"><button type="button" class="ghost" id="edge-cancel">Cancel</button><button type="submit" class="primary" id="edge-save">Create edge</button></div>
+  </form>
+</dialog>
+
+<dialog id="route-dialog">
+  <form id="route-form" method="dialog" novalidate>
+    <h2 id="route-title">Route</h2>
+    <label class="field"><span>Name</span><input id="r-name" required maxlength="80" placeholder="Blog" autocomplete="off"></label>
+    <div class="row">
+      <label class="field grow"><span>Listen address</span><input id="r-ip" placeholder="0.0.0.0" autocomplete="off" spellcheck="false"><small><code>0.0.0.0</code> = all addresses on the edge.</small></label>
+      <label class="field port"><span>Port</span><input id="r-port" required inputmode="numeric" placeholder="443" autocomplete="off"></label>
+    </div>
+    <label class="field"><span>Domains <em>(optional)</em></span><textarea id="r-domains" rows="2" spellcheck="false" placeholder="example.com&#10;*.example.com"></textarea>
+      <small>One per line. Matched on TLS SNI, HTTP Host, or the Minecraft server address. Empty = everything on this port.</small></label>
+    <label class="field"><span>Targets</span><textarea id="r-targets" required rows="3" spellcheck="false" placeholder="10.100.0.2:443"></textarea>
+      <small>One <code>ip:port</code> per line. Several targets are balanced round-robin; unhealthy ones are skipped. They must be reachable <em>from the edge</em>.</small></label>
+    <fieldset class="field scope"><legend>Runs on</legend>
+      <label class="check"><input type="radio" name="scope" value="all" checked> All edges <small>(including ones added later)</small></label>
+      <label class="check"><input type="radio" name="scope" value="some"> Selected edges</label>
+      <div id="r-edges" class="checklist" hidden></div>
+    </fieldset>
+    <div class="checks">
+      <label class="check"><input id="r-proxy" type="checkbox"> Send PROXY protocol v2 <small>(the target must expect it)</small></label>
+      <label class="check"><input id="r-enabled" type="checkbox" checked> Enabled</label>
+    </div>
+    <ul id="route-errors" class="errors" hidden></ul>
+    <div class="buttons"><button type="button" class="ghost" id="route-cancel">Cancel</button><button type="submit" class="primary" id="route-save">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="confirm">
+  <form id="confirm-form" method="dialog">
+    <h2 id="confirm-title">Are you sure?</h2>
+    <p id="confirm-body"></p>
+    <label class="field" id="confirm-type-wrap" hidden><span id="confirm-type-label"></span><input id="confirm-type" autocomplete="off" spellcheck="false"></label>
+    <label class="check" id="confirm-force-wrap" hidden><input id="confirm-force" type="checkbox"> <span id="confirm-force-label"></span></label>
+    <ul id="confirm-errors" class="errors" hidden></ul>
+    <div class="buttons"><button type="button" class="ghost" id="confirm-cancel">Cancel</button><button type="submit" class="danger-solid" id="confirm-ok">Delete</button></div>
+  </form>
+</dialog>
+
+<dialog id="password-dialog">
+  <form id="password-form" method="dialog">
+    <h2>Change password</h2>
+    <label class="field"><span>Current password</span><input id="p-cur" type="password" autocomplete="current-password" required></label>
+    <label class="field"><span>New password</span><input id="p-new" type="password" autocomplete="new-password" required><small>At least 12 characters. Other sessions are signed out.</small></label>
+    <ul id="password-errors" class="errors" hidden></ul>
+    <div class="buttons"><button type="button" class="ghost" id="password-cancel">Cancel</button><button type="submit" class="primary">Change password</button></div>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>

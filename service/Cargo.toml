@@ -1,0 +1,48 @@
+[package]
+name = "edge-lbd"
+version = "0.1.0"
+edition = "2021"
+description = "Configurable L4 edge load balancer: routes (domain, listen ip:port) -> targets, with a web UI"
+
+[lib]
+name = "edge_lbd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "edge-lbd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs", "process"] }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+rand = "0.8"
+subtle = "2"
+clap = { version = "4", features = ["derive", "env"] }
+socket2 = { version = "0.5", features = ["all"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
+argon2 = "0.5"
+sha2 = "0.10"
+async-trait = "0.1"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
