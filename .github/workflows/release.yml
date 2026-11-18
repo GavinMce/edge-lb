@@ -52,7 +52,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.arch }}
-          path: edge-lbd-*
+          # Only the tarball and its checksum: the unpacked folder next to them is not a release asset.
+          path: |
+            edge-lbd-*.tar.gz
+            edge-lbd-*.tar.gz.sha256
 
   windows:
     name: Build Windows desktop app (MSI)
@@ -132,4 +135,9 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes
+        run: |
+          # Exactly these files, each with its checksum: x86_64 and aarch64 tarballs, the MSI, the
+          # server installer. Plain files only (gh cannot upload a directory).
+          find dist -maxdepth 1 -type f | sort
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 8 || { echo "expected 8 release files"; exit 1; }
+          find dist -maxdepth 1 -type f -print0 | xargs -0 gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
