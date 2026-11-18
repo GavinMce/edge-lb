@@ -254,6 +254,7 @@ ExecStart=$BIN_PATH $args
 User=$SVC_USER
 Group=$SVC_USER
 Environment=HOME=$DATA
+Environment=EDGE_LB_DEPLOYMENT=server
 Restart=on-failure
 RestartSec=2
 StateDirectory=edge-lb-controller

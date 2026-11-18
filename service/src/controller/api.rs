@@ -233,6 +233,7 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
         "routes": c.routes(),
         "sites": c.sites(),
         "gateway_listener": c.gateway_endpoint().map(|g| g.hostport),
+        "deployment": c.deployment(),
         "dns": c.dns_status(),
         "dns_names": c.store.read(|s| s.settings.dns.as_ref().map(|d| d.names.clone())),
     }))

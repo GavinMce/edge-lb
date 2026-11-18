@@ -29,10 +29,15 @@ struct Rig {
 }
 
 async fn start(tag: &str) -> Rig {
+    start_with(tag, |_| {}).await
+}
+
+async fn start_with(tag: &str, tweak: impl FnOnce(&mut Options)) -> Rig {
     let dir = std::env::temp_dir().join(format!("edge-lbd-capi-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut o = Options::new(dir.clone());
     o.bootstrapper = Some(Arc::new(Offline));
+    tweak(&mut o);
     let ctl = Controller::start(o).await.unwrap();
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -141,6 +146,20 @@ async fn nothing_works_before_setup_and_setup_needs_the_console_code() {
     let reopened = edge_lbd::controller::store::Store::open(&r.dir).unwrap();
     let hash = reopened.read(|s| s.admin.as_ref().map(|a| a.password_hash.clone())).unwrap();
     assert!(hash.starts_with("$argon2") && !hash.contains(PW));
+}
+
+#[tokio::test]
+async fn status_says_how_the_controller_is_run_so_the_ui_can_explain_gateway_setup() {
+    let plain = start("deploy-none").await;
+    let ck = signed_in(&plain).await;
+    let st = api(&plain, &ck, "GET", "/api/status", None).await.json();
+    assert!(st["deployment"].is_null(), "{st}");
+    assert!(st["gateway_listener"].is_null(), "no listener unless asked for: {st}");
+
+    let desktop = start_with("deploy-desktop", |o| o.deployment = Some("desktop".into())).await;
+    let ck = signed_in(&desktop).await;
+    let st = api(&desktop, &ck, "GET", "/api/status", None).await.json();
+    assert_eq!(st["deployment"], "desktop");
 }
 
 #[tokio::test]

@@ -106,7 +106,7 @@ fn installs_the_program_both_cpu_builds_and_a_sandboxed_unit() {
         unit.contains("ExecStart=/usr/local/bin/edge-lb-controller controller --listen 127.0.0.1:8080 --data-dir /var/lib/edge-lb-controller --agents-dir /usr/local/lib/edge-lb/agents\n"),
         "{unit}"
     );
-    for must in ["User=edge-lb", "StateDirectory=edge-lb-controller", "StateDirectoryMode=0700", "NoNewPrivileges=yes", "ProtectSystem=strict", "CapabilityBoundingSet=\n"] {
+    for must in ["User=edge-lb", "Environment=EDGE_LB_DEPLOYMENT=server", "StateDirectory=edge-lb-controller", "StateDirectoryMode=0700", "NoNewPrivileges=yes", "ProtectSystem=strict", "CapabilityBoundingSet=\n"] {
         assert!(unit.contains(must), "missing {must}");
     }
     assert!(!unit.contains("--gateway") && !unit.contains("--secure-cookies") && !unit.contains("--allow-public"));
