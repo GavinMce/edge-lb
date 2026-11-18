@@ -208,6 +208,8 @@ function renderPills() {
     pills.push(h('span', { class: 'pill' + (bad ? ' bad' : held ? ' warn' : '') }, 'DNS ',
       h('b', null, bad ? 'error' : held ? 'held' : d.last_sync ? 'synced' : 'pending')));
   }
+  const outdated = st.edges.filter((e) => e.update && e.update.available).length + (st.sites || []).filter((x) => x.gateway.update && x.gateway.update.available).length;
+  if (outdated) pills.push(h('span', { class: 'pill warn', title: 'Edges and gateways that run an older version than this controller' }, h('b', null, outdated), ` update${outdated === 1 ? '' : 's'} available`));
   pills.push(h('span', { class: 'pill' }, 'v', st.version));
   $('#pills').replaceChildren(...pills);
   $('#whoami').textContent = S.user || '';
@@ -231,6 +233,43 @@ function renderPage(full) {
   if (S.tab === 'logs') return renderLogs(main); // refreshes itself
   if (S.tab === 'settings') return renderSettings(main);
   if (S.tab === 'activity') return renderActivity(main);
+}
+
+// ---- updates -----------------------------------------------------------------------------
+// The controller decides what is out of date (an edge or gateway older than itself) and does the
+// updating; the UI only shows it and asks. Nothing here starts an update by itself.
+
+const updateBadge = (u) => h('span', { class: 'badge warn', title: `This controller is v${S.status.version}; this machine runs an older version` }, `Update to v${u.available}`);
+
+/** What to say about one machine's update: available, running, failed, or just finished. */
+function updateNote(u) {
+  if (!u) return null;
+  if (u.state === 'running') return h('div', null, h('span', { class: 'badge warn' }, 'Updating…'), u.message && h('div', { class: 'sub' }, u.message));
+  const parts = [];
+  if (u.available) parts.push(updateBadge(u));
+  if (u.state === 'failed') parts.push(h('div', { class: 'err' }, 'Update failed: ' + u.message));
+  else if (u.state === 'done' && u.at && Date.now() / 1000 - u.at < 900) parts.push(h('div', { class: 'sub' }, '✓ ' + u.message));
+  return parts.length ? h('div', null, parts) : null;
+}
+
+function updateEdge(e, healthyCount) {
+  const only = e.status === 'healthy' && healthyCount === 1;
+  confirmDialog({
+    title: `Update ${e.name} to v${e.update.available}?`,
+    body: 'The edge is restarted, so connections through it are cut for a few seconds and clients reconnect. Its identity, routes and WireGuard key are kept. If the new version does not start, the previous one is put back automatically.',
+    okLabel: 'Update',
+    forceLabel: only ? 'This is the only healthy edge: your service is interrupted while it restarts.' : null,
+    run: () => api('POST', `/edges/${encodeURIComponent(e.id)}/update`),
+  });
+}
+
+function updateGateway(site) {
+  confirmDialog({
+    title: `Update the gateway for ${site.name} to v${site.gateway.update.available}?`,
+    body: 'The gateway downloads the new version from this controller, installs it and restarts. Its tunnels drop for a few seconds, so traffic to this site pauses until they are back. If the new version cannot reach this controller, the gateway goes back to the previous version by itself.',
+    okLabel: 'Update',
+    run: () => api('POST', `/sites/${encodeURIComponent(site.id)}/update`),
+  });
 }
 
 // ---- edges page --------------------------------------------------------------------------
@@ -272,6 +311,7 @@ function edgeCard(e) {
       h('div', { class: 'mono' }, e.ip ? addr(e.ip, e.mgmt_port).replace(/:\d+$/, '') : 'pending…'),
       h('div', { class: 'sub' }, providerText(e)),
       live && live.version && h('div', { class: 'sub' }, 'edge v' + live.version),
+      updateNote(e.update),
       tunnelNote(e),
     ),
     h('div', { class: 'cell' },
@@ -289,10 +329,11 @@ function edgeCard(e) {
       ] : h('div', { class: 'sub' }, '—'),
     ),
     h('div', { class: 'row-actions' },
+      e.update && e.update.available && e.update.state !== 'running' && ['healthy', 'unreachable'].includes(e.status) && h('button', { class: 'small', type: 'button', onclick: () => updateEdge(e, healthyCount) }, 'Update'),
       e.status === 'failed' && h('button', { class: 'small', type: 'button', onclick: () => retryEdge(e) }, 'Retry'),
       h('button', { class: 'small', type: 'button', onclick: () => { S.expanded.has(e.id) ? S.expanded.delete(e.id) : S.expanded.add(e.id); renderPage(true); } }, open ? 'Hide log' : 'Log'),
       (e.status === 'failed' || e.status === 'deleting') && h('button', { class: 'small', type: 'button', title: 'Drop this record without touching the provider or machine', onclick: () => forgetEdge(e) }, 'Forget'),
-      e.status !== 'deleting' && e.status !== 'draining' && h('button', { class: 'small danger', type: 'button', onclick: () => deleteEdge(e, healthyCount) }, 'Delete'),
+      e.status !== 'deleting' && e.status !== 'draining' && h('button', { class: 'small danger', type: 'button', disabled: !!(e.update && e.update.state === 'running'), title: e.update && e.update.state === 'running' ? 'Wait for the update to finish' : null, onclick: () => deleteEdge(e, healthyCount) }, 'Delete'),
     ),
     open && h('div', { class: 'log mono' }, [...e.log].reverse().map((l) => h('div', null, h('time', null, new Date(l.ts * 1000).toLocaleTimeString()), h('span', null, l.msg)))),
   );
@@ -461,12 +502,15 @@ function siteCard(site) {
       h('span', { class: 'badge ' + st.cls }, st.label),
       g.error && h('div', { class: 'err' }, g.error),
       g.enrolled && h('div', { class: 'sub' }, g.online ? `v${g.version || '?'} · seen ${ago(g.last_seen)}` : `last seen ${ago(g.last_seen)}`),
+      g.enrolled && updateNote(g.update),
+      g.enrolled && g.update && g.update.available && g.online && !g.self_update && h('div', { class: 'sub' }, 'Installed before updates were possible: re-enrol once to turn them on.'),
       g.enrolled && g.tunnel_ip && h('div', { class: 'sub mono' }, 'tunnel ' + g.tunnel_ip),
       !g.enrolled && g.enrol_pending_until && h('div', { class: 'sub' }, 'command expires in ' + inFuture(g.enrol_pending_until)),
     ),
     h('div', { class: 'cell' }, h('span', { class: 'label' }, 'Tunnels to edges'), h('div', { class: 'targets' }, tunnels)),
     h('div', { class: 'cell' }, h('span', { class: 'label' }, 'Routes'), h('div', null, `${site.routes} route${site.routes === 1 ? '' : 's'}`)),
     h('div', { class: 'row-actions' },
+      g.update && g.update.available && g.self_update && g.online && g.update.state !== 'running' && h('button', { class: 'small', type: 'button', onclick: () => updateGateway(site) }, 'Update gateway'),
       h('button', { class: 'small' + (g.enrolled ? '' : ' primary'), type: 'button', onclick: () => openEnrol(site) }, g.enrolled ? 'Re-enrol gateway' : 'Connect gateway'),
       h('button', { class: 'small', type: 'button', onclick: () => openSiteDialog(site) }, 'Edit'),
       h('button', { class: 'small danger', type: 'button', onclick: () => deleteSite(site) }, 'Delete')),

@@ -333,6 +333,18 @@ async fn audit(State(st): State<AppState>) -> Json<Value> {
     Json(json!(st.ctl.audit.tail(200)))
 }
 
+/// Start updating an edge to this controller's version. Answers at once; progress is in `/api/status`.
+async fn update_edge_software(State(st): State<AppState>, Extension(Actor(u)): Extension<Actor>, Path(id): Path<String>) -> Res<Response> {
+    st.ctl.update_edge(&u, &id)?;
+    Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// Ask a site's gateway to update itself. It acts on this at its next check-in.
+async fn update_gateway_software(State(st): State<AppState>, Extension(Actor(u)): Extension<Actor>, Path(id): Path<String>) -> Res<Response> {
+    st.ctl.update_gateway(&u, &id)?;
+    Ok(StatusCode::ACCEPTED.into_response())
+}
+
 /// Recent connections from the edges (see `controller::logs`). Filters are query parameters.
 async fn logs(State(st): State<AppState>, Query(q): Query<super::logs::LogQuery>) -> Res<Json<super::logs::LogsView>> {
     Ok(Json(st.ctl.access_logs(q).await?))
@@ -356,11 +368,13 @@ pub fn router(ctl: Arc<Controller>, secure_cookies: bool) -> Router {
         .route("/edges", get(list_edges).post(create_edge))
         .route("/edges/:id", axum::routing::delete(delete_edge))
         .route("/edges/:id/retry", post(retry_edge))
+        .route("/edges/:id/update", post(update_edge_software))
         .route("/edges/:id/forget", post(forget_edge))
         .route("/catalog", get(catalog))
         .route("/sites", get(list_sites).post(create_site))
         .route("/sites/:id", axum::routing::put(update_site).delete(delete_site))
         .route("/sites/:id/enrol", post(enrol_site))
+        .route("/sites/:id/update", post(update_gateway_software))
         .route("/routes", get(list_routes).post(create_route))
         .route("/routes/:id", axum::routing::put(update_route).delete(delete_route))
         .route("/settings", get(get_settings).put(put_settings))

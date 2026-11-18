@@ -10,16 +10,17 @@
 
 use super::model::*;
 use super::{invalid, Controller, CtlError, GatewayUpdate};
-use crate::gateway::{EnrolReq, EnrolResp, Handshake, SyncReq, SyncResp};
+use crate::gateway::{EnrolReq, EnrolResp, Handshake, SyncReq, SyncResp, UpdateResult};
 use crate::wg::{self, Cidr};
 use crate::{config, pki, tls};
-use axum::extract::{DefaultBodyLimit, Path, State as Ax};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path, Query, State as Ax};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -92,6 +93,8 @@ pub struct GwLive {
     pub applied_hash: Option<String>,
     pub error: Option<String>,
     pub handshakes: Vec<Handshake>,
+    /// What this gateway says it can do (see `gateway::CAP_SELF_UPDATE`).
+    pub caps: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +121,10 @@ pub struct GatewayView {
     pub in_sync: Option<bool>,
     pub error: Option<String>,
     pub tunnels: Vec<TunnelView>,
+    /// Whether it runs an older version than this controller, and how an update is going.
+    pub update: super::update::UpdateView,
+    /// It was installed with the updater, so an update can be started from the UI.
+    pub self_update: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -279,6 +286,8 @@ impl Controller {
                             in_sync: l.filter(|_| online).map(|l| l.applied_hash.is_some() && l.applied_hash == want),
                             error: l.filter(|_| online).and_then(|l| l.error.clone()),
                             tunnels,
+                            update: self.gateway_update_view(&site.id, l.filter(|_| g.public_key.is_some()).map(|l| l.version.as_str())),
+                            self_update: l.is_some_and(|l| l.caps.iter().any(|c| c == crate::gateway::CAP_SELF_UPDATE)),
                         },
                     }
                 })
@@ -422,17 +431,21 @@ impl Controller {
         let id = self.site_for_secret(secret).ok_or(GwError::Unauthorized)?;
         let desired = self.store.read(|s| s.site(&id).and_then(|site| s.wg_for_gateway(site))).ok_or_else(|| GwError::Internal("no tunnel address allocated yet".into()))?;
         let hash = desired.hash();
+        let version: String = req.version.chars().take(32).collect();
+        let result = req.update_result.map(|r| UpdateResult { version: r.version.chars().take(32).collect(), ok: r.ok, error: r.error.map(|e| e.chars().take(300).collect()) });
+        let update = self.gw_update_step(&id, &version, result.as_ref());
         self.gw_live.write().unwrap().insert(
             id,
             GwLive {
                 last_seen: now(),
-                version: req.version.chars().take(32).collect(),
+                version,
                 applied_hash: req.applied_hash.filter(|h| h.len() <= 64),
                 error: req.error.map(|e| e.chars().take(300).collect()),
                 handshakes: req.handshakes.into_iter().filter(|h| wg::is_key(&h.public_key)).take(wg::MAX_PEERS).collect(),
+                caps: req.caps.into_iter().filter(|c| c.len() <= 32).take(8).collect(),
             },
         );
-        Ok(SyncResp { hash, desired })
+        Ok(SyncResp { hash, desired, update })
     }
 
     /// The installer a gateway machine runs. Needs a live token but doesn't use it up.
@@ -461,6 +474,16 @@ impl Controller {
         self.site_for_token(token).ok_or(GwError::Unauthorized)?;
         let path = self.opts.agents.get(arch).ok_or_else(|| GwError::Invalid("no binary for that architecture".into()))?;
         tokio::fs::read(path).await.map_err(|e| GwError::Internal(format!("reading the binary to serve: {e}")))
+    }
+
+    /// The gateway binary for an update, to a gateway that proves who it is with its secret. Returns the
+    /// bytes and their SHA-256, which the updater checks. `arch` is only ever looked up, never used as a path.
+    pub async fn gw_update_binary(&self, secret: &str, arch: &str) -> Result<(Vec<u8>, String), GwError> {
+        self.site_for_secret(secret).ok_or(GwError::Unauthorized)?;
+        let path = self.opts.agents.get(arch).ok_or_else(|| GwError::Invalid("no binary for that architecture".into()))?;
+        let bin = tokio::fs::read(path).await.map_err(|e| GwError::Internal(format!("reading the binary to serve: {e}")))?;
+        let sha = sha256_hex(&bin);
+        Ok((bin, sha))
     }
 
     /// Turn the gateway listener on, change it, or (with `None`) turn it off, without a restart.
@@ -571,6 +594,7 @@ pub fn gateway_router(ctl: Arc<Controller>) -> Router {
         .route("/gw/binary/:token/:arch", get(h_binary))
         .route("/gw/v1/enroll", post(h_enroll))
         .route("/gw/v1/sync", post(h_sync))
+        .route("/gw/v1/update", get(h_update))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(ctl)
 }
@@ -592,6 +616,17 @@ async fn h_enroll(Ax(c): Ctl, Json(req): Json<EnrolReq>) -> Result<Json<EnrolRes
 async fn h_sync(Ax(c): Ctl, headers: HeaderMap, Json(req): Json<SyncReq>) -> Result<Json<SyncResp>, GwError> {
     let secret = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).ok_or(GwError::Unauthorized)?;
     Ok(Json(c.gw_sync(secret, req)?))
+}
+
+async fn h_update(Ax(c): Ctl, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Result<Response, GwError> {
+    let secret = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).ok_or(GwError::Unauthorized)?;
+    let (bin, sha) = c.gw_update_binary(secret, q.get("arch").map(String::as_str).unwrap_or("")).await?;
+    let headers = [
+        (header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream")),
+        (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        (HeaderName::from_static("x-edge-lb-sha256"), HeaderValue::from_str(&sha).expect("hex is a valid header value")),
+    ];
+    Ok((headers, bin).into_response())
 }
 
 // ---- the installer served to a gateway machine -----------------------------------------------------------
@@ -650,7 +685,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/edge-lbd gateway --controller @HOST@ --pin @FP@ --data-dir /var/lib/edge-lb-gateway
+ExecStart=/usr/local/bin/edge-lbd gateway --controller @HOST@ --pin @FP@ --data-dir /var/lib/edge-lb-gateway --self-update
 Restart=always
 RestartSec=3
 CapabilityBoundingSet=CAP_NET_ADMIN
@@ -667,8 +702,37 @@ SystemCallArchitectures=native
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+# The updater. The gateway above has a read-only filesystem, so it can't replace its own binary; when the
+# controller offers a new version it drops a request file, and this root helper (started by systemd when
+# the file appears) fetches the binary from the controller, checks it, swaps it in and undoes that if the
+# new version can't reach the controller.
+cat > /etc/systemd/system/edge-lb-gateway-update.service <<'UNIT'
+[Unit]
+Description=edge-lb gateway updater
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/edge-lbd gateway-update --controller @HOST@ --pin @FP@ --data-dir /var/lib/edge-lb-gateway
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+LockPersonality=yes
+UNIT
+cat > /etc/systemd/system/edge-lb-gateway-update.path <<'UNIT'
+[Unit]
+Description=edge-lb gateway update trigger
+
+[Path]
+PathExists=/var/lib/edge-lb-gateway/update-request
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 systemctl daemon-reload
 systemctl enable edge-lb-gateway >/dev/null 2>&1
+systemctl enable --now edge-lb-gateway-update.path >/dev/null 2>&1 || log "could not enable the update trigger; this gateway can't update itself"
 systemctl restart edge-lb-gateway
 
 i=0

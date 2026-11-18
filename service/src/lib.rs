@@ -10,6 +10,7 @@ pub mod engine;
 pub mod firewall;
 pub mod fsutil;
 pub mod gateway;
+pub mod gateway_update;
 pub mod pki;
 pub mod proxy;
 pub mod sniff;

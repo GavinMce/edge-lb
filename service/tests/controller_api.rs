@@ -381,3 +381,35 @@ async fn the_connection_log_needs_a_session_and_validates_its_filters() {
     assert_eq!(api(&r, &ck, "GET", "/api/logs?limit=999999&host=%20", None).await.status, 200);
     assert_eq!(api(&r, &ck, "GET", "/api/logs?limit=abc", None).await.status, 400);
 }
+
+#[tokio::test]
+async fn updates_are_started_through_the_api_and_the_status_says_what_is_outdated() {
+    let r = start("updates").await;
+    // Not signed in: nothing can be started.
+    assert_eq!(http(r.addr, "POST", "/api/edges/x/update", Opts { csrf: true, ..Default::default() }).await.status, 401);
+    assert_eq!(http(r.addr, "POST", "/api/sites/x/update", Opts { csrf: true, ..Default::default() }).await.status, 401);
+    let ck = signed_in(&r).await;
+    // Starting an update changes machines, so it needs the same header every other change does.
+    assert_eq!(http(r.addr, "POST", "/api/edges/x/update", Opts { cookie: Some(&ck), csrf: false, body: None }).await.status, 403);
+    assert_eq!(http(r.addr, "POST", "/api/sites/x/update", Opts { cookie: Some(&ck), csrf: false, body: None }).await.status, 403);
+    assert_eq!(api(&r, &ck, "POST", "/api/edges/nowhere/update", None).await.status, 404);
+    assert_eq!(api(&r, &ck, "POST", "/api/sites/nowhere/update", None).await.status, 404);
+
+    // An edge that isn't serving yet, and a site with no gateway, give a reason and start nothing.
+    api(&r, &ck, "POST", "/api/edges", Some(json!({"name": "Lab Box", "provider": {"kind": "manual"}, "ip": "192.0.2.10"}))).await;
+    let resp = api(&r, &ck, "POST", "/api/edges/lab-box/update", None).await;
+    assert_eq!(resp.status, 409, "{}", resp.body);
+    assert!(resp.json()["error"].as_str().unwrap().contains("once it is serving"), "{}", resp.body);
+    assert_eq!(api(&r, &ck, "POST", "/api/sites", Some(json!({"name": "Home", "lan_cidrs": ["192.168.1.0/24"]}))).await.status, 201);
+    let resp = api(&r, &ck, "POST", "/api/sites/home/update", None).await;
+    assert_eq!(resp.status, 409, "{}", resp.body);
+    assert!(resp.json()["error"].as_str().unwrap().contains("no gateway yet"), "{}", resp.body);
+
+    // The status carries what the UI needs, for edges and for gateways, and nothing is outdated yet.
+    let st = api(&r, &ck, "GET", "/api/status", None).await.json();
+    let e = &st["edges"][0]["update"];
+    assert!(e["available"].is_null() && e["state"].is_null(), "{e}");
+    let g = &st["sites"][0]["gateway"];
+    assert!(g["update"]["available"].is_null() && g["update"]["state"].is_null(), "{g}");
+    assert_eq!(g["self_update"], false);
+}

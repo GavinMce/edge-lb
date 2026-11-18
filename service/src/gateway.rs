@@ -23,6 +23,19 @@ use tracing::{error, info, warn};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Advertised by a gateway installed with the updater unit, so the controller knows an update can
+/// be started from the UI. Older gateways don't send it and have to be re-enrolled once.
+pub const CAP_SELF_UPDATE: &str = "self-update";
+
+// Files in the data directory that the agent and the root updater (`gateway_update`) use to talk.
+/// The agent creates it to ask for an update; systemd starts the updater when it appears.
+pub const UPDATE_REQUEST: &str = "update-request";
+/// What the updater found out, for the agent to pass to the controller.
+pub const UPDATE_RESULT: &str = "update-result.json";
+/// `<version> <unix time>`, rewritten after every good round trip to the controller. After an update
+/// the updater waits for it to name the new version before trusting that version.
+pub const SYNCED: &str = "synced";
+
 // ---- wire types shared with the controller ----------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +71,27 @@ pub struct SyncReq {
     pub error: Option<String>,
     #[serde(default)]
     pub handshakes: Vec<Handshake>,
+    /// What this gateway can do beyond the basics (see [`CAP_SELF_UPDATE`]).
+    #[serde(default)]
+    pub caps: Vec<String>,
+    /// How the last update attempt ended, sent until the controller has it.
+    #[serde(default)]
+    pub update_result: Option<UpdateResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateResult {
+    /// The version that was being installed (empty if it never got as far as learning it).
+    pub version: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// "Please move to this version." Present only while an update has been asked for in the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateOffer {
+    pub version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +99,8 @@ pub struct SyncResp {
     /// Opaque; echoed back as `applied_hash` once applied.
     pub hash: String,
     pub desired: Desired,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateOffer>,
 }
 
 // ---- how the gateway touches the host (replaceable in tests) --------------------------------------
@@ -135,6 +171,8 @@ pub struct Options {
     pub data_dir: PathBuf,
     pub interval: Duration,
     pub host: Arc<dyn HostWg>,
+    /// The updater unit is installed: advertise [`CAP_SELF_UPDATE`] and act on update offers.
+    pub self_update: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -153,7 +191,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn client(pin: &str) -> Result<reqwest::Client> {
+pub(crate) fn client(pin: &str) -> Result<reqwest::Client> {
     tls::init();
     let cfg = tls::pinned_client_config_no_auth(pin)?;
     reqwest::Client::builder()
@@ -262,7 +300,16 @@ pub async fn run(opts: Options) -> Result<()> {
                 opts.host.probe(&stale).await;
             }
         }
-        let req = SyncReq { version: VERSION.into(), applied_hash: applied_hash.clone(), error: last_error.clone(), handshakes };
+        // What the updater left for the controller (only meaningful when this install has an updater).
+        let update_result = if opts.self_update { read_update_result(&opts.data_dir) } else { None };
+        let req = SyncReq {
+            version: VERSION.into(),
+            applied_hash: applied_hash.clone(),
+            error: last_error.clone(),
+            handshakes,
+            caps: if opts.self_update { vec![CAP_SELF_UPDATE.into()] } else { Vec::new() },
+            update_result: update_result.clone(),
+        };
         match post::<_, SyncResp>(&http, &format!("{base}/gw/v1/sync"), Some(&identity.secret), &req).await {
             Ok(resp) => {
                 if !reachable || rejected {
@@ -270,6 +317,16 @@ pub async fn run(opts: Options) -> Result<()> {
                 }
                 reachable = true;
                 rejected = false;
+                // The controller has the result now; and this round trip proves this version works.
+                if update_result.is_some() {
+                    let _ = std::fs::remove_file(opts.data_dir.join(UPDATE_RESULT));
+                }
+                if opts.self_update {
+                    let _ = write_private(&opts.data_dir.join(SYNCED), format!("{VERSION} {}\n", unix_now()).as_bytes());
+                    if let Some(offer) = &resp.update {
+                        request_update(&opts.data_dir, offer);
+                    }
+                }
                 if applied_hash.as_deref() != Some(resp.hash.as_str()) || last_error.is_some() {
                     match opts.host.apply(&resp.desired, &key_path).await {
                         Ok(()) => {
@@ -306,6 +363,31 @@ pub async fn run(opts: Options) -> Result<()> {
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn read_update_result(dir: &Path) -> Option<UpdateResult> {
+    let r: UpdateResult = serde_json::from_slice(&std::fs::read(dir.join(UPDATE_RESULT)).ok()?).ok()?;
+    // Whatever is in this file goes to the controller and into its UI: keep it small.
+    Some(UpdateResult { version: r.version.chars().take(32).collect(), ok: r.ok, error: r.error.map(|e| e.chars().take(300).collect()) })
+}
+
+/// Ask the root updater to move to the offered version, unless that is what is already running or
+/// a request is already waiting. The updater, not this process, fetches the binary and replaces it:
+/// this service's filesystem is read-only, and keeping it that way is the point of the sandbox.
+fn request_update(dir: &Path, offer: &UpdateOffer) {
+    let ok_version = !offer.version.is_empty() && offer.version.len() <= 32 && offer.version.bytes().all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b));
+    let path = dir.join(UPDATE_REQUEST);
+    if !ok_version || offer.version == VERSION || path.exists() {
+        return;
+    }
+    match write_private(&path, format!("{}\n", offer.version).as_bytes()) {
+        Ok(()) => info!("the controller offered version {}; asked the updater to install it", offer.version),
+        Err(e) => warn!("could not ask the updater to install {}: {e:#}", offer.version),
+    }
+}
+
 /// `--pin` accepts the certificate fingerprint exactly as the controller prints it.
 pub fn valid_pin(p: &str) -> bool {
     p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit())
@@ -335,6 +417,49 @@ mod tests {
         assert_eq!(ips(stale_peers(&desired(), &hs(Some(3), Some(30)))), ["10.100.0.2"]);
         assert_eq!(ips(stale_peers(&desired(), &hs(None, Some(5)))), ["10.100.0.1"], "never handshaken");
         assert_eq!(ips(stale_peers(&desired(), &[])), ["10.100.0.1", "10.100.0.2"], "no information at all");
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("edge-lb-gw-unit-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn an_offer_becomes_a_request_for_the_updater_only_when_it_means_a_change() {
+        let d = scratch("offer");
+        let offer = |v: &str| UpdateOffer { version: v.into() };
+        let req = d.join(UPDATE_REQUEST);
+
+        request_update(&d, &offer(VERSION));
+        assert!(!req.exists(), "already on that version: nothing to ask for");
+        for bad in ["", "1.0; rm -rf /", "$(id)", &"9".repeat(40), "1 2"] {
+            request_update(&d, &offer(bad));
+            assert!(!req.exists(), "{bad:?} must never reach the updater");
+        }
+        request_update(&d, &offer("9.9.9"));
+        assert_eq!(std::fs::read_to_string(&req).unwrap().trim(), "9.9.9");
+
+        // A request already waiting is left alone, not rewritten under the updater's feet.
+        request_update(&d, &offer("9.9.10"));
+        assert_eq!(std::fs::read_to_string(&req).unwrap().trim(), "9.9.9");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn what_the_updater_left_is_read_back_clipped_and_ignored_if_garbled() {
+        let d = scratch("result");
+        assert!(read_update_result(&d).is_none(), "no file, no result");
+        std::fs::write(d.join(UPDATE_RESULT), "not json").unwrap();
+        assert!(read_update_result(&d).is_none());
+        let long = "x".repeat(1000);
+        std::fs::write(d.join(UPDATE_RESULT), serde_json::to_vec(&UpdateResult { version: "9".repeat(100), ok: false, error: Some(long) }).unwrap()).unwrap();
+        let r = read_update_result(&d).unwrap();
+        assert!(!r.ok);
+        assert_eq!(r.version.len(), 32);
+        assert_eq!(r.error.unwrap().len(), 300, "this goes into the controller's UI, so it is kept short");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

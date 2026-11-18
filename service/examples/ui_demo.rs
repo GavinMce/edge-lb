@@ -177,6 +177,7 @@ async fn main() {
         data_dir: gwdir,
         interval: Duration::from_secs(2),
         host: Arc::new(DemoHost(Mutex::new(vec![]))),
+        self_update: false,
     }));
     ctl.start_enrolment("demo", "cabin").unwrap();
     let l = TcpListener::bind(("127.0.0.1", port)).await.unwrap();

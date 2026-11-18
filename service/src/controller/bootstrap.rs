@@ -42,6 +42,16 @@ pub trait Bootstrapper: Send + Sync {
     /// Can we log in (key accepted, SSH up)?
     async fn probe(&self, t: &Target) -> Result<()>;
     async fn install(&self, t: &Target, ctx: &InstallCtx) -> Result<Installed>;
+    /// Replace the edge software on a machine that already runs it, keeping its identity. If the
+    /// new version doesn't start, the previous one is put back and an error is returned. The default
+    /// is a plain reinstall, which is safe to repeat but has no way back.
+    async fn update(&self, t: &Target, ctx: &InstallCtx) -> Result<Installed> {
+        self.install(t, ctx).await
+    }
+    /// Go back to the version the last [`update`](Bootstrapper::update) replaced.
+    async fn rollback(&self, _t: &Target) -> Result<()> {
+        bail!("this machine cannot be rolled back")
+    }
     /// Best-effort removal from a machine we don't destroy.
     async fn uninstall(&self, t: &Target) -> Result<()>;
     /// Forget any recorded SSH host key for this machine (IPs get recycled).
@@ -109,22 +119,9 @@ const MARK_END: &str = "-----END EDGE-LB IDENTITY-----";
 const WG_BEGIN: &str = "-----BEGIN EDGE-LB WIREGUARD-----";
 const WG_END: &str = "-----END EDGE-LB WIREGUARD-----";
 
-const INSTALL_SH: &str = r#"#!/bin/sh
-# edge-lb installer. Pushed by the controller over SSH. Idempotent.
-set -eu
-UP='@UP@'
-BIN=/usr/local/bin/edge-lbd
-log() { printf 'edge-lb: %s\n' "$*" >&2; }
-[ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 1; }
-command -v systemctl >/dev/null 2>&1 || { log "systemd is required"; exit 1; }
-
-install -d -m 0755 /etc/edge-lb
-install -m 0755 "$UP/edge-lbd" "$BIN.new"
-mv -f "$BIN.new" "$BIN"
-install -m 0644 "$UP/ca.pem" /etc/edge-lb/controller-ca.pem
-
-cat > /etc/systemd/system/edge-lbd.service <<'UNIT'
-[Unit]
+/// The edge's systemd unit. The installer and the updater both write it, so an updated edge gets
+/// the same hardening as a new one.
+const EDGE_UNIT: &str = r#"[Unit]
 Description=edge-lb edge node
 After=network-online.target
 Wants=network-online.target
@@ -154,7 +151,47 @@ SystemCallArchitectures=native
 LimitNOFILE=65536
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target"#;
+
+/// The WireGuard helper's unit, shared the same way.
+const WG_UNIT: &str = r#"[Unit]
+Description=edge-lb WireGuard applier
+After=network-online.target edge-lbd.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/edge-lbd wg-apply --state /var/lib/edge-lb/wg.json --key /etc/edge-lb/wg.key
+Restart=always
+RestartSec=2
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target"#;
+
+const INSTALL_SH: &str = r#"#!/bin/sh
+# edge-lb installer. Pushed by the controller over SSH. Idempotent.
+set -eu
+UP='@UP@'
+BIN=/usr/local/bin/edge-lbd
+log() { printf 'edge-lb: %s\n' "$*" >&2; }
+[ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 1; }
+command -v systemctl >/dev/null 2>&1 || { log "systemd is required"; exit 1; }
+
+install -d -m 0755 /etc/edge-lb
+install -m 0755 "$UP/edge-lbd" "$BIN.new"
+mv -f "$BIN.new" "$BIN"
+install -m 0644 "$UP/ca.pem" /etc/edge-lb/controller-ca.pem
+
+cat > /etc/systemd/system/edge-lbd.service <<'UNIT'
+@EDGE_UNIT@
 UNIT
 
 systemctl daemon-reload
@@ -196,27 +233,7 @@ setup_wg() {
   chmod 600 /etc/edge-lb/wg.key
   WGPUB=$(wg pubkey < /etc/edge-lb/wg.key) || return 1
   cat > /etc/systemd/system/edge-lb-wg.service <<'UNIT'
-[Unit]
-Description=edge-lb WireGuard applier
-After=network-online.target edge-lbd.service
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/edge-lbd wg-apply --state /var/lib/edge-lb/wg.json --key /etc/edge-lb/wg.key
-Restart=always
-RestartSec=2
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-SystemCallArchitectures=native
-
-[Install]
-WantedBy=multi-user.target
+@WG_UNIT@
 UNIT
   systemctl daemon-reload
   systemctl enable edge-lb-wg >/dev/null 2>&1
@@ -235,6 +252,97 @@ if [ -n "$WGPUB" ]; then
   echo "$WGPUB"
   echo '@WGEND@'
 fi
+"#;
+
+/// Puts the previous version back. Shared by the updater (when an update goes wrong) and the
+/// rollback the controller asks for when it can't reach an edge it just updated.
+const RESTORE_FN: &str = r#"restore() {
+  [ -f "$BIN.old" ] && mv -f "$BIN.old" "$BIN"
+  [ -f "$SYSD/edge-lbd.service.old" ] && mv -f "$SYSD/edge-lbd.service.old" "$SYSD/edge-lbd.service"
+  [ -f "$SYSD/edge-lb-wg.service.old" ] && mv -f "$SYSD/edge-lb-wg.service.old" "$SYSD/edge-lb-wg.service"
+  systemctl daemon-reload
+  systemctl restart edge-lbd
+  if [ -f "$SYSD/edge-lb-wg.service" ]; then systemctl restart edge-lb-wg; fi
+  return 0
+}"#;
+
+/// Replaces the edge in place. Keeps the identity (the data directory is untouched) and the WireGuard
+/// key, keeps a copy of the old binary and units, and if the new version doesn't come up puts them back.
+const UPDATE_SH: &str = r#"#!/bin/sh
+# edge-lb updater. Pushed by the controller over SSH.
+set -eu
+UP='@UP@'
+ROOT='@ROOT@'
+BIN="$ROOT/usr/local/bin/edge-lbd"
+SYSD="$ROOT/etc/systemd/system"
+CERT="$ROOT/var/lib/edge-lb/mgmt-cert.pem"
+log() { printf 'edge-lb: %s\n' "$*" >&2; }
+@ROOTCHECK@
+command -v systemctl >/dev/null 2>&1 || { log "systemd is required"; exit 1; }
+[ -x "$BIN" ] && [ -f "$SYSD/edge-lbd.service" ] || { log "edge-lb is not installed on this machine"; exit 1; }
+
+# Will the new binary even run here? Find that out before touching anything.
+"$UP/edge-lbd" --version >/dev/null 2>&1 || { log "the new binary does not run on this machine"; rm -rf "$UP"; exit 1; }
+
+@RESTORE_FN@
+
+OK=0
+trap 'rc=$?; rm -rf "$UP"; if [ "$OK" != 1 ]; then log "the update did not complete; putting the previous version back"; restore || log "could not put the previous version back"; fi; exit $rc' EXIT
+
+cp -p "$BIN" "$BIN.old"
+cp -p "$SYSD/edge-lbd.service" "$SYSD/edge-lbd.service.old"
+if [ -f "$SYSD/edge-lb-wg.service" ]; then cp -p "$SYSD/edge-lb-wg.service" "$SYSD/edge-lb-wg.service.old"; fi
+
+install -m 0755 "$UP/edge-lbd" "$BIN.new"
+mv -f "$BIN.new" "$BIN"
+cat > "$SYSD/edge-lbd.service" <<'UNIT'
+@EDGE_UNIT@
+UNIT
+if [ -f "$SYSD/edge-lb-wg.service" ]; then
+  cat > "$SYSD/edge-lb-wg.service" <<'UNIT'
+@WG_UNIT@
+UNIT
+fi
+systemctl daemon-reload
+systemctl restart edge-lbd
+
+i=0
+while [ "$i" -lt @WAIT@ ]; do
+  if systemctl is-active --quiet edge-lbd && [ -s "$CERT" ]; then break; fi
+  sleep 1; i=$((i+1))
+done
+if ! systemctl is-active --quiet edge-lbd || [ ! -s "$CERT" ]; then
+  journalctl -u edge-lbd -n 20 --no-pager >&2 || true
+  log "the new version did not start"
+  exit 1
+fi
+if [ -f "$SYSD/edge-lb-wg.service" ]; then systemctl restart edge-lb-wg || log "the WireGuard helper did not restart"; fi
+OK=1
+
+echo '@BEGIN@'
+cat "$CERT"
+echo '@END@'
+if [ -s "$ROOT/etc/edge-lb/wg.key" ] && command -v wg >/dev/null 2>&1; then
+  WGPUB=$(wg pubkey < "$ROOT/etc/edge-lb/wg.key" 2>/dev/null) || WGPUB=''
+  if [ -n "$WGPUB" ]; then
+    echo '@WGBEGIN@'
+    echo "$WGPUB"
+    echo '@WGEND@'
+  fi
+fi
+"#;
+
+/// Goes back to the version the last update replaced.
+const ROLLBACK_SH: &str = r#"#!/bin/sh
+set -u
+ROOT='@ROOT@'
+BIN="$ROOT/usr/local/bin/edge-lbd"
+SYSD="$ROOT/etc/systemd/system"
+log() { printf 'edge-lb: %s\n' "$*" >&2; }
+@ROOTCHECK@
+[ -f "$BIN.old" ] || { log "there is no previous version to go back to"; exit 1; }
+@RESTORE_FN@
+restore
 "#;
 
 /// Same flow without root or systemd: installs under a scratch directory and runs the edge as
@@ -284,6 +392,8 @@ pub fn install_script(upload_dir: &str, mgmt_port: u16, stage: Option<&Path>) ->
     }
     let base = if stage.is_some() { INSTALL_STAGED_SH } else { INSTALL_SH };
     let mut s = base
+        .replace("@EDGE_UNIT@", EDGE_UNIT)
+        .replace("@WG_UNIT@", WG_UNIT)
         .replace("@UP@", upload_dir)
         .replace("@PORT@", &mgmt_port.to_string())
         .replace("@BEGIN@", MARK_BEGIN)
@@ -294,6 +404,36 @@ pub fn install_script(upload_dir: &str, mgmt_port: u16, stage: Option<&Path>) ->
         s = s.replace("@STAGE@", &shell_safe(st)?);
     }
     Ok(s)
+}
+
+const ROOT_CHECK: &str = r#"[ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 1; }"#;
+
+/// Render the updater. `root` is for tests only: it points the script at a scratch directory (and
+/// skips the root check) so the real logic can be run against a fake `systemctl`.
+pub fn update_script(upload_dir: &str, mgmt_port: u16, root: Option<&Path>, wait_secs: u32) -> Result<String> {
+    if !valid_remote_dir(upload_dir) {
+        bail!("refusing to use unexpected remote directory {upload_dir:?}");
+    }
+    Ok(UPDATE_SH
+        .replace("@RESTORE_FN@", RESTORE_FN)
+        .replace("@EDGE_UNIT@", EDGE_UNIT)
+        .replace("@WG_UNIT@", WG_UNIT)
+        .replace("@ROOTCHECK@", if root.is_some() { ":" } else { ROOT_CHECK })
+        .replace("@ROOT@", &root.map(shell_safe).transpose()?.unwrap_or_default())
+        .replace("@UP@", upload_dir)
+        .replace("@PORT@", &mgmt_port.to_string())
+        .replace("@WAIT@", &wait_secs.to_string())
+        .replace("@BEGIN@", MARK_BEGIN)
+        .replace("@END@", MARK_END)
+        .replace("@WGBEGIN@", WG_BEGIN)
+        .replace("@WGEND@", WG_END))
+}
+
+pub fn rollback_script(root: Option<&Path>) -> Result<String> {
+    Ok(ROLLBACK_SH
+        .replace("@RESTORE_FN@", RESTORE_FN)
+        .replace("@ROOTCHECK@", if root.is_some() { ":" } else { ROOT_CHECK })
+        .replace("@ROOT@", &root.map(shell_safe).transpose()?.unwrap_or_default()))
 }
 
 fn uninstall_script(stage: Option<&Path>) -> Result<String> {
@@ -403,6 +543,29 @@ impl SshBootstrapper {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Copy the edge binary and the controller's CA to a private temporary directory on the machine
+    /// and return its path. What the machine reports about itself is only ever compared against our
+    /// own table, never interpolated.
+    async fn upload(&self, t: &Target, ctx: &InstallCtx) -> Result<String> {
+        let dir = self.ssh(t, "umask 077; mktemp -d /tmp/edge-lb.XXXXXXXXXX", Input::None, Duration::from_secs(20)).await?;
+        let dir = dir.trim().to_string();
+        if !valid_remote_dir(&dir) {
+            bail!("remote host returned an unexpected temp directory: {dir:?}");
+        }
+        let raw_arch = self.ssh(t, "uname -m", Input::None, Duration::from_secs(20)).await?;
+        let binary = ctx.agents.get(raw_arch.trim()).ok_or_else(|| {
+            let have = ctx.agents.archs().join(", ");
+            let have = if have.is_empty() { "none".to_string() } else { have };
+            anyhow!(
+                "this machine's CPU ({}) has no matching edge binary; this controller can install: {have}",
+                raw_arch.trim().chars().take(20).filter(|c| c.is_ascii_graphic()).collect::<String>()
+            )
+        })?;
+        self.ssh(t, &format!("cat > {dir}/edge-lbd"), Input::File(binary.to_path_buf()), Duration::from_secs(300)).await.context("uploading the edge binary")?;
+        self.ssh(t, &format!("cat > {dir}/ca.pem"), Input::Bytes(ctx.ca_pem.clone().into_bytes()), Duration::from_secs(30)).await?;
+        Ok(dir)
+    }
+
     fn sudo(t: &Target) -> &'static str {
         if t.ssh_user == "root" { "" } else { "sudo -n " }
     }
@@ -415,26 +578,25 @@ impl Bootstrapper for SshBootstrapper {
     }
 
     async fn install(&self, t: &Target, ctx: &InstallCtx) -> Result<Installed> {
-        let dir = self.ssh(t, "umask 077; mktemp -d /tmp/edge-lb.XXXXXXXXXX", Input::None, Duration::from_secs(20)).await?;
-        let dir = dir.trim().to_string();
-        if !valid_remote_dir(&dir) {
-            bail!("remote host returned an unexpected temp directory: {dir:?}");
-        }
-        // What the machine reports is only ever compared against our own table, never interpolated.
-        let raw_arch = self.ssh(t, "uname -m", Input::None, Duration::from_secs(20)).await?;
-        let binary = ctx.agents.get(raw_arch.trim()).ok_or_else(|| {
-            let have = ctx.agents.archs().join(", ");
-            let have = if have.is_empty() { "none".to_string() } else { have };
-            anyhow!(
-                "this machine's CPU ({}) has no matching edge binary; this controller can install: {have}",
-                raw_arch.trim().chars().take(20).filter(|c| c.is_ascii_graphic()).collect::<String>()
-            )
-        })?;
-        self.ssh(t, &format!("cat > {dir}/edge-lbd"), Input::File(binary.to_path_buf()), Duration::from_secs(300)).await.context("uploading the edge binary")?;
-        self.ssh(t, &format!("cat > {dir}/ca.pem"), Input::Bytes(ctx.ca_pem.clone().into_bytes()), Duration::from_secs(30)).await?;
+        let dir = self.upload(t, ctx).await?;
         let script = install_script(&dir, t.mgmt_port, self.stage.as_deref())?;
         let out = self.ssh(t, &format!("{}sh -s", Self::sudo(t)), Input::Bytes(script.into_bytes()), Duration::from_secs(180)).await.context("running the installer")?;
         Ok(Installed { cert_pem: extract_identity(&out)?, mgmt_port: t.mgmt_port, wg_public_key: extract_wg_key(&out) })
+    }
+
+    async fn update(&self, t: &Target, ctx: &InstallCtx) -> Result<Installed> {
+        if self.stage.is_some() {
+            bail!("a staged test install has no systemd to update");
+        }
+        let dir = self.upload(t, ctx).await?;
+        let script = update_script(&dir, t.mgmt_port, None, 30)?;
+        let out = self.ssh(t, &format!("{}sh -s", Self::sudo(t)), Input::Bytes(script.into_bytes()), Duration::from_secs(180)).await.context("running the updater")?;
+        Ok(Installed { cert_pem: extract_identity(&out)?, mgmt_port: t.mgmt_port, wg_public_key: extract_wg_key(&out) })
+    }
+
+    async fn rollback(&self, t: &Target) -> Result<()> {
+        let script = rollback_script(None)?;
+        self.ssh(t, &format!("{}sh -s", Self::sudo(t)), Input::Bytes(script.into_bytes()), Duration::from_secs(120)).await.context("going back to the previous version").map(|_| ())
     }
 
     async fn uninstall(&self, t: &Target) -> Result<()> {
@@ -488,7 +650,9 @@ mod tests {
     async fn scripts_have_valid_shell_syntax_and_no_leftover_placeholders() {
         let prod = install_script("/tmp/edge-lb.AbC123xyz9", 7443, None).unwrap();
         let staged = install_script("/tmp/edge-lb.AbC123xyz9", 17443, Some(Path::new("/tmp/stage-x"))).unwrap();
-        for s in [&prod, &staged, &uninstall_script(None).unwrap(), &uninstall_script(Some(Path::new("/tmp/s"))).unwrap()] {
+        let update = update_script("/tmp/edge-lb.AbC123xyz9", 7443, None, 30).unwrap();
+        let tested = update_script("/tmp/edge-lb.AbC123xyz9", 7443, Some(Path::new("/tmp/scratch-x")), 2).unwrap();
+        for s in [&prod, &staged, &uninstall_script(None).unwrap(), &uninstall_script(Some(Path::new("/tmp/s"))).unwrap(), &update, &tested, &rollback_script(None).unwrap(), &rollback_script(Some(Path::new("/tmp/s"))).unwrap()] {
             assert!(!s.contains('@'), "unreplaced placeholder in:\n{s}");
             assert!(sh_syntax_ok(s).await, "shell syntax error in:\n{s}");
         }
@@ -501,6 +665,11 @@ mod tests {
         assert!(prod.contains("CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH"));
         assert!(prod.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
         assert!(!staged.contains("wg-apply"), "the test installer needs no root or WireGuard");
+        // An updated edge gets exactly the unit a new one does: the installer and the updater share it.
+        for line in ["CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "DynamicUser=yes", "edge --mgmt 0.0.0.0:7443", "wg-apply --state /var/lib/edge-lb/wg.json"] {
+            assert!(update.contains(line) && prod.contains(line), "{line}");
+        }
+        assert!(update.contains("trap ") && update.contains("restore") && update.contains(".old"), "the updater must be able to undo itself");
     }
 
     #[test]

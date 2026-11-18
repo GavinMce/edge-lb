@@ -25,7 +25,7 @@ const SSH_WAIT_MANUAL_SECS: u64 = 180;
 const MAX_LOG: usize = 40;
 const DNS_REFRESH: Duration = Duration::from_secs(60);
 
-fn push_log(e: &mut Edge, msg: &str) {
+pub(crate) fn push_log(e: &mut Edge, msg: &str) {
     e.log.push(LogEntry { ts: now(), msg: msg.to_string() });
     if e.log.len() > MAX_LOG {
         let excess = e.log.len() - MAX_LOG;
@@ -84,7 +84,7 @@ impl Controller {
 
     // ---- state helpers -------------------------------------------------------------------------
 
-    fn mutate(&self, id: &str, f: impl FnOnce(&mut Edge)) {
+    pub(crate) fn mutate(&self, id: &str, f: impl FnOnce(&mut Edge)) {
         let _ = self.store.update(|s| {
             if let Some(e) = s.edges.iter_mut().find(|e| e.id == id) {
                 f(e);
@@ -150,7 +150,7 @@ impl Controller {
         }
     }
 
-    fn target(e: &Edge) -> Option<Target> {
+    pub(crate) fn target(e: &Edge) -> Option<Target> {
         Some(Target { edge_id: e.id.clone(), ip: e.ip?, ssh_user: e.ssh_user.clone(), ssh_port: e.ssh_port, mgmt_port: e.mgmt_port })
     }
 
@@ -167,7 +167,7 @@ impl Controller {
         Ok((Hetzner::new(&self.opts.hetzner_base, &token)?, image))
     }
 
-    fn set_live(&self, id: &str, f: impl FnOnce(&mut Live)) {
+    pub(crate) fn set_live(&self, id: &str, f: impl FnOnce(&mut Live)) {
         let mut live = self.live.write().unwrap();
         f(live.entry(id.to_string()).or_default());
     }
