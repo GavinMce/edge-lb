@@ -214,7 +214,8 @@ function renderPills() {
 }
 
 function setTab(tab) {
-  S.tab = ['edges', 'sites', 'routes', 'settings', 'activity'].includes(tab) ? tab : 'edges';
+  stopLogs();
+  S.tab = ['edges', 'sites', 'routes', 'map', 'logs', 'settings', 'activity'].includes(tab) ? tab : 'edges';
   document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === S.tab));
   renderPage(true);
 }
@@ -225,7 +226,9 @@ function renderPage(full) {
   if (S.tab === 'edges') return renderEdges(main);
   if (S.tab === 'sites') return renderSites(main);
   if (S.tab === 'routes') return renderRoutes(main);
-  if (!full) return; // settings & activity are not live: don't clobber what the user is typing
+  if (S.tab === 'map') return renderMap(main, full); // redraws only when something changed
+  if (!full) return; // the rest are not live: don't clobber what the user is typing
+  if (S.tab === 'logs') return renderLogs(main); // refreshes itself
   if (S.tab === 'settings') return renderSettings(main);
   if (S.tab === 'activity') return renderActivity(main);
 }
@@ -745,7 +748,8 @@ function applicableEdges(r) {
   return r.edges.length ? all.filter((e) => r.edges.includes(e.id)) : all;
 }
 
-function routeOnEdge(r, e) {
+/** How one route is doing on one edge: a colour class, a tooltip and its live connection count. */
+function routeEdgeState(r, e) {
   const rs = e.live && e.live.status && e.live.status.routes.find((x) => x.id === r.id);
   let cls = '', tip = 'Not applied yet';
   if (!r.enabled) { tip = 'Route disabled'; }
@@ -754,7 +758,11 @@ function routeOnEdge(r, e) {
     if (rs.status.state === 'listening') { cls = rs.status.targets.length && rs.status.targets.every((t) => t.healthy === false) ? 'bad' : rs.status.targets.some((t) => t.healthy === false) ? 'warn' : 'ok'; tip = cls === 'ok' ? 'Listening' : 'Listening; some targets are down'; }
     else if (rs.status.state === 'error') { cls = 'bad'; tip = 'Cannot listen: ' + (rs.status.error || ''); }
   } else { cls = 'warn'; }
-  const conns = rs && rs.status ? rs.status.active_connections : null;
+  return { cls, tip, conns: rs && rs.status ? rs.status.active_connections : null };
+}
+
+function routeOnEdge(r, e) {
+  const { cls, tip, conns } = routeEdgeState(r, e);
   return h('div', { class: 'target', title: tip }, h('span', { class: 'dot ' + cls }), h('span', null, e.name), conns != null && h('span', { class: 'sub' }, `${conns} active`));
 }
 
@@ -994,6 +1002,289 @@ $('#password-form').addEventListener('submit', async (ev) => {
     if (e.status !== 401) showErrors($('#password-errors'), e.lines);
   }
 });
+
+// ---- logs page ---------------------------------------------------------------------------
+// Each edge keeps its recent connections in memory; the controller fetches them when asked.
+
+const LOG = { edge: '', route: '', outcome: '', client: '', host: '', live: true, timer: null, busy: false, results: null, clientInput: null };
+
+const RESULT = {
+  ok: { label: 'Forwarded', cls: 'ok', tip: 'Connected to a target and carried traffic' },
+  unreachable: { label: 'Target down', cls: 'bad', tip: 'A route matched, but no target accepted the connection' },
+  no_route: { label: 'No route', cls: 'warn', tip: 'The client asked for a hostname or port that no route serves' },
+  aborted: { label: 'No request', cls: '', tip: 'The client connected and left without asking for anything (a port probe, say)' },
+};
+
+function fmtDuration(ms) {
+  if (ms < 1000) return ms + ' ms';
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + ' s';
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${Math.round(s - m * 60)}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+const routeName = (id) => { const r = ((S.status && S.status.routes) || []).find((x) => x.id === id); return r ? r.name : id; };
+
+function stopLogs() { clearInterval(LOG.timer); LOG.timer = null; }
+
+async function loadLogs() {
+  if (LOG.busy || !LOG.results) return;
+  LOG.busy = true;
+  try {
+    const q = new URLSearchParams();
+    for (const k of ['edge', 'route', 'outcome', 'client', 'host']) if (LOG[k]) q.set(k, LOG[k]);
+    q.set('limit', '300');
+    drawLogs(await api('GET', '/logs?' + q));
+  } catch (e) {
+    if (e.status !== 401 && LOG.results) LOG.results.replaceChildren(h('div', { class: 'banner bad' }, e.lines.join(' ')));
+  } finally {
+    LOG.busy = false;
+  }
+}
+
+function logRow(r) {
+  const res = RESULT[r.outcome] || { label: r.outcome, cls: '' };
+  const when = new Date(r.ts_ms);
+  const moved = r.bytes_up || r.bytes_down;
+  return h('tr', null,
+    h('td', { title: when.toLocaleString() }, when.toLocaleTimeString()),
+    h('td', null, r.edge_name),
+    h('td', { class: 'mono' }, h('button', { class: 'linklike', type: 'button', title: 'Show only this client', onclick: () => { LOG.client = r.client; if (LOG.clientInput) LOG.clientInput.value = r.client; loadLogs(); } }, r.client)),
+    h('td', { class: 'mono' }, r.host || '—'),
+    h('td', null, r.route ? routeName(r.route) : '—'),
+    h('td', { class: 'mono' }, r.target || '—'),
+    h('td', null, h('span', { class: 'badge ' + res.cls, title: res.tip }, res.label)),
+    h('td', { class: 'num' }, moved ? `↑ ${fmtBytes(r.bytes_up)}  ↓ ${fmtBytes(r.bytes_down)}` : '—'),
+    h('td', { class: 'num' }, fmtDuration(r.duration_ms)));
+}
+
+function drawLogs(view) {
+  const failed = view.sources.filter((s) => s.error);
+  const filtered = ['edge', 'route', 'outcome', 'client', 'host'].some((k) => LOG[k]);
+  const none = !view.sources.length ? 'No edges yet.' : filtered ? 'No connections match these filters.' : 'No connections yet. A connection is listed once it ends.';
+  LOG.results.replaceChildren(
+    ...failed.map((s) => h('div', { class: 'banner' }, `Could not read ${s.name}: ${s.error}`)),
+    ...(view.entries.length
+      ? [h('div', { class: 'tablewrap' }, h('table', { class: 'audit logs' },
+        h('thead', null, h('tr', null, ['When', 'Edge', 'Client', 'Hostname', 'Route', 'Target', 'Result', 'Traffic', 'Time open'].map((t) => h('th', null, t)))),
+        h('tbody', null, view.entries.map(logRow)))),
+      h('p', { class: 'hint' }, `The ${view.entries.length} most recent connections, newest first.`)]
+      : [h('div', { class: 'empty' }, none)]));
+}
+
+function renderLogs(main) {
+  stopLogs();
+  const st = S.status || { edges: [], routes: [] };
+  const select = (key, label, options) => {
+    const s = h('select', { 'aria-label': label }, h('option', { value: '' }, label), options.map(([v, text]) => h('option', { value: v }, text)));
+    s.value = LOG[key];
+    s.addEventListener('change', () => { LOG[key] = s.value; loadLogs(); });
+    return s;
+  };
+  const text = (key, placeholder) => {
+    const i = h('input', { type: 'search', placeholder, autocomplete: 'off', spellcheck: 'false', 'aria-label': placeholder });
+    i.value = LOG[key];
+    let t;
+    i.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { LOG[key] = i.value.trim(); loadLogs(); }, 300); });
+    return i;
+  };
+  LOG.clientInput = text('client', 'Client address');
+  LOG.results = h('div');
+  const live = h('input', { type: 'checkbox', checked: LOG.live });
+  live.addEventListener('change', () => { LOG.live = live.checked; });
+  main.replaceChildren(
+    h('div', { class: 'page-head' }, h('h2', null, 'Logs'),
+      h('div', { class: 'row-actions' },
+        h('label', { class: 'check', title: 'Refresh every few seconds' }, live, 'Live'),
+        h('button', { class: 'ghost', type: 'button', onclick: loadLogs }, 'Refresh'))),
+    h('div', { class: 'filters' },
+      select('edge', 'All edges', st.edges.map((e) => [e.id, e.name])),
+      select('route', 'All routes', st.routes.map((r) => [r.id, r.name])),
+      select('outcome', 'Any result', [['ok', 'Forwarded'], ['unreachable', 'Target down'], ['no_route', 'No route'], ['aborted', 'No request'], ['rejected', 'Turned away (no route or no request)']]),
+      LOG.clientInput,
+      text('host', 'Hostname')),
+    LOG.results,
+    h('p', { class: 'hint' }, 'A connection is listed when it ends. Each edge keeps the last few thousand in memory, and turned-away connections are kept apart so a port scan cannot push real traffic out. Restarting an edge clears its log. Nothing is stored on the controller.'));
+  loadLogs();
+  LOG.timer = setInterval(() => { if (LOG.live && !document.hidden && !document.querySelector('dialog[open]')) loadLogs(); }, 3000);
+}
+
+// ---- map page ----------------------------------------------------------------------------
+// Internet -> edges -> routes -> sites (or straight to the targets), drawn as SVG. Colours come
+// from the same health the other pages show; nothing here is guessed.
+
+const SVGNS = 'http://www.w3.org/2000/svg';
+const MAP = { sig: null };
+
+/** Like `h`, for SVG. Styling is by class and presentation attributes only (the CSP forbids inline style). */
+function sv(tag, props, ...kids) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid == null || kid === false) continue;
+    el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+
+/** Cut text to roughly `px` pixels at `size`px; the full text stays in the tooltip. */
+function fit(s, px, size) {
+  const max = Math.max(4, Math.floor(px / (size * 0.58)));
+  s = String(s);
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
+
+/** All good -> ok; mixed -> warn; none good -> bad if anything is, else off. */
+function blend(states) {
+  const real = states.filter((c) => c !== 'off');
+  if (!real.length) return 'off';
+  if (real.every((c) => c === 'ok')) return 'ok';
+  if (real.some((c) => c === 'ok')) return 'warn';
+  return real.some((c) => c === 'bad') ? 'bad' : 'warn';
+}
+
+const MAP_COLS = [{ x: 20, w: 150, label: 'Internet' }, { x: 240, w: 210, label: 'Edges' }, { x: 530, w: 270, label: 'Routes' }, { x: 880, w: 260, label: 'Sites & targets' }];
+const ROW = 15, GAP = 14, TOP = 30;
+
+function buildMap(st) {
+  const edges = st.edges.filter((e) => e.status !== 'deleting');
+  const sites = st.sites || [];
+  // Grouped by where they lead, so the lines into the last column don't cross.
+  const dest = (r) => { const i = sites.findIndex((s) => s.id === r.site); return i < 0 ? sites.length : i; };
+  const routes = [...st.routes].sort((a, b) => dest(a) - dest(b) || a.listen.port - b.listen.port || a.name.localeCompare(b.name));
+  const nodes = [], links = [];
+  const add = (n) => { nodes.push(n); return n; };
+
+  // Internet, with the DNS names that point at the edges.
+  const dnsNames = st.dns_names || [];
+  const dnsCls = !st.dns_names ? 'off' : st.dns.last_error ? 'bad' : st.dns.held ? 'warn' : 'ok';
+  add({ id: 'net', kind: 'net', col: 0, cls: dnsCls === 'off' ? 'net' : dnsCls, title: 'Internet', href: null,
+    rows: dnsNames.length ? ['DNS names:', ...dnsNames.slice(0, 4).map((n) => ' ' + n), ...(dnsNames.length > 4 ? [` +${dnsNames.length - 4} more`] : [])] : ['no DNS names set'],
+    tip: dnsNames.length ? `Clients reach the edges through: ${dnsNames.join(', ')}` + (st.dns && st.dns.last_error ? `\nDNS error: ${st.dns.last_error}` : st.dns && st.dns.held ? '\nDNS is held: no healthy edge, so records are left as they are' : '') : 'No DNS names are managed here; clients must be pointed at the edges some other way' });
+
+  for (const e of edges) {
+    const info = STATUS[e.status] || { label: e.status, cls: '' };
+    const ls = e.live && e.live.status;
+    add({ id: 'e:' + e.id, kind: 'edge', col: 1, cls: e.status === 'healthy' ? 'ok' : info.cls || 'off', title: e.name, href: '#/edges',
+      rows: [[e.region, e.ip].filter(Boolean).join(' · ') || 'no address yet', `${info.label}${ls ? ` · ${ls.active_connections} active` : ''}`],
+      tip: `${e.name}: ${info.label}${e.error ? '\n' + e.error : ''}` });
+    links.push({ from: 'net', to: 'e:' + e.id, cls: e.status === 'healthy' ? 'ok' : e.status === 'unreachable' || e.status === 'failed' ? 'bad' : 'off' });
+  }
+
+  for (const r of routes) {
+    const on = edges.filter((e) => !r.edges.length || r.edges.includes(e.id));
+    const per = on.map((e) => ({ e, s: routeEdgeState(r, e) }));
+    const cls = !r.enabled ? 'off' : on.length ? blend(per.map((p) => p.s.cls || 'warn')) : 'warn';
+    const hosts = r.domains.length ? r.domains.slice(0, 2).join(', ') + (r.domains.length > 2 ? ` +${r.domains.length - 2}` : '') : 'any host';
+    const t0 = r.targets[0];
+    add({ id: 'r:' + r.id, kind: 'route', col: 2, cls, title: r.name, href: '#/routes',
+      rows: [`:${r.listen.port} · ${hosts}`, `→ ${t0 ? addr(t0.address, t0.port) : 'no target'}${r.targets.length > 1 ? ` +${r.targets.length - 1}` : ''}${r.proxy_protocol ? ' · PROXY' : ''}`],
+      tip: `${r.name}${r.enabled ? '' : ' (disabled)'}\nlistens on ${addr(r.listen.ip, r.listen.port)}\nhosts: ${r.domains.join(', ') || 'any'}\ntargets: ${r.targets.map((t) => addr(t.address, t.port)).join(', ')}` });
+    for (const p of per) links.push({ from: 'e:' + p.e.id, to: 'r:' + r.id, cls: !r.enabled ? 'off' : p.s.cls || 'off', tip: `${p.e.name} → ${r.name}: ${p.s.tip}` });
+    // Where the route's traffic goes.
+    const site = r.site && sites.find((x) => x.id === r.site);
+    const dcls = !r.enabled ? 'off' : site ? gatewayState(site.gateway).cls || 'off' : blend(per.map((p) => p.s.cls || 'warn'));
+    links.push({ from: 'r:' + r.id, to: site ? 's:' + site.id : 'direct', cls: dcls });
+  }
+
+  for (const s of sites) {
+    const g = s.gateway, gs = gatewayState(g);
+    add({ id: 's:' + s.id, kind: 'site', col: 3, cls: gs.cls || 'off', title: s.name, href: '#/sites',
+      rows: [s.lan_cidrs.join(', ') || 'no LAN ranges', `Gateway: ${gs.label}${g.enrolled && g.tunnel_ip ? ' · ' + g.tunnel_ip : ''}`],
+      tunnels: (g.tunnels || []).map((t) => ({ cls: t.up ? 'ok' : t.up === false ? 'bad' : 'off', text: `${t.edge_name} · ${t.up ? 'tunnel up' : t.up === false ? 'no handshake' : 'unknown'}` })),
+      tip: `${s.name}: gateway ${gs.label.toLowerCase()}${g.error ? '\n' + g.error : ''}` });
+  }
+  if (links.some((l) => l.to === 'direct')) {
+    add({ id: 'direct', kind: 'direct', col: 3, cls: 'off', title: 'Direct targets', href: null, rows: ['reached straight from the edge', 'no tunnel'], tip: 'Routes with no site: each edge connects to the target address itself' });
+  }
+
+  // Layout: stack each column, then centre the shorter ones against the tallest.
+  const heights = [0, 0, 0, 0];
+  for (const n of nodes) {
+    n.nrows = n.rows.length + (n.tunnels ? n.tunnels.length : 0);
+    n.h = 30 + ROW * n.nrows + 6;
+    heights[n.col] += n.h + GAP;
+  }
+  const tallest = Math.max(...heights) - GAP;
+  const y = heights.map((h0) => TOP + (tallest - (h0 - GAP)) / 2);
+  for (const n of nodes) {
+    const c = MAP_COLS[n.col];
+    n.x = c.x; n.w = c.w; n.y = y[n.col];
+    y[n.col] += n.h + GAP;
+  }
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const live = links.filter((l) => byId.has(l.from) && byId.has(l.to));
+  const sig = JSON.stringify([nodes.map((n) => [n.id, n.cls, n.title, n.rows, n.tunnels, n.y]), live.map((l) => [l.from, l.to, l.cls])]);
+  return { nodes, links: live, byId, width: MAP_COLS[3].x + MAP_COLS[3].w + 20, height: TOP + tallest + 24, sig };
+}
+
+function drawMap(m) {
+  const adj = { up: new Map(), down: new Map() };
+  for (const l of m.links) {
+    (adj.down.get(l.from) || adj.down.set(l.from, []).get(l.from)).push(l.to);
+    (adj.up.get(l.to) || adj.up.set(l.to, []).get(l.to)).push(l.from);
+  }
+  const reach = (id, dir) => { const seen = new Set([id]), todo = [id]; while (todo.length) for (const n of adj[dir].get(todo.pop()) || []) if (!seen.has(n)) { seen.add(n); todo.push(n); } return seen; };
+
+  const svg = sv('svg', { class: 'map', width: m.width, height: m.height, viewBox: `0 0 ${m.width} ${m.height}`, role: 'img', 'aria-label': 'Diagram of edges, routes and sites' });
+  MAP_COLS.forEach((c) => svg.append(sv('text', { class: 'collabel', x: c.x, y: 14 }, c.label)));
+  const linkEls = m.links.map((l) => {
+    const a = m.byId.get(l.from), b = m.byId.get(l.to);
+    const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2, mx = (x1 + x2) / 2;
+    const p = sv('path', { class: 'mlink ' + l.cls, d: `M${x1} ${y1} C${mx} ${y1} ${mx} ${y2} ${x2} ${y2}` }, l.tip ? sv('title', null, l.tip) : null);
+    svg.append(p);
+    return { l, p };
+  });
+  const nodeEls = new Map();
+  for (const n of m.nodes) {
+    const g = sv('g', { class: `mnode ${n.kind} ${n.cls}`, tabindex: n.href ? 0 : null, role: n.href ? 'link' : null, 'aria-label': n.title },
+      sv('title', null, n.tip),
+      sv('rect', { class: 'mbox', x: n.x, y: n.y, width: n.w, height: n.h, rx: 9 }),
+      sv('rect', { class: 'mbar', x: n.x, y: n.y + 8, width: 4, height: n.h - 16, rx: 2 }),
+      sv('text', { class: 'mt', x: n.x + 14, y: n.y + 21 }, fit(n.title, n.w - 24, 13)),
+      n.rows.map((t, i) => sv('text', { class: 'ms', x: n.x + 14, y: n.y + 40 + ROW * i }, fit(t, n.w - 24, 12))),
+      (n.tunnels || []).map((t, i) => {
+        const yy = n.y + 40 + ROW * (n.rows.length + i);
+        return [sv('circle', { class: 'tdot ' + t.cls, cx: n.x + 18, cy: yy - 4, r: 3.5 }), sv('text', { class: 'ms', x: n.x + 28, y: yy }, fit(t.text, n.w - 40, 12))];
+      }));
+    if (n.href) {
+      g.addEventListener('click', () => { location.hash = n.href; });
+      g.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); location.hash = n.href; } });
+    }
+    const trace = (on) => {
+      svg.classList.toggle('hl', on);
+      const hot = on ? new Set([...reach(n.id, 'up'), ...reach(n.id, 'down')]) : new Set();
+      for (const [id, el] of nodeEls) el.classList.toggle('hot', hot.has(id));
+      for (const { l, p } of linkEls) p.classList.toggle('hot', hot.has(l.from) && hot.has(l.to));
+    };
+    g.addEventListener('mouseenter', () => trace(true));
+    g.addEventListener('mouseleave', () => trace(false));
+    g.addEventListener('focus', () => trace(true));
+    g.addEventListener('blur', () => trace(false));
+    nodeEls.set(n.id, g);
+    svg.append(g);
+  }
+  return svg;
+}
+
+function renderMap(main, full) {
+  const st = S.status;
+  if (!st) return;
+  const m = buildMap(st);
+  if (!full && MAP.sig === m.sig && main.querySelector('svg.map')) return; // nothing changed: keep the hover and scroll
+  MAP.sig = m.sig;
+  const key = (cls, text) => h('span', { class: 'key' }, h('span', { class: 'dot ' + cls }), text);
+  main.replaceChildren(
+    h('div', { class: 'page-head' }, h('h2', null, 'Map'), h('span', { class: 'sub' }, 'Point at a box to trace its path. Click it to open its page.')),
+    ...(m.nodes.length <= 1
+      ? [h('div', { class: 'empty' }, 'Nothing to draw yet. Add an edge, then a route, and this shows how traffic gets from the internet to your targets.')]
+      : [h('div', { class: 'mapwrap' }, drawMap(m)),
+        h('div', { class: 'legend' }, key('ok', 'Working'), key('warn', 'Starting, or partly down'), key('bad', 'Down'), key('', 'Off or not applied'), h('span', { class: 'key' }, h('span', { class: 'dash' }), 'Not carrying traffic'))]));
+}
 
 // ---- activity page -----------------------------------------------------------------------
 

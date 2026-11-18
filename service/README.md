@@ -249,6 +249,34 @@ Names listed in Settings point at **every healthy edge** (Cloudflare, DNS-only �
 passthrough). Only records edge-lb created (tagged `edge-lb:managed`) are ever changed. With **no**
 healthy edge it holds the existing records rather than emptying the answer. Set the drain time ≥ your TTL.
 
+## Logs and the map
+
+**Logs** shows recent connections across all your edges: when, which edge, the client address, the hostname it
+asked for, the route and target it was sent to, how it ended, bytes each way and how long it stayed open. Filter by
+edge, route, result, client or hostname; click a client address to show only that client. Results are:
+
+| | |
+|---|---|
+| Forwarded | connected to a target and carried traffic |
+| Target down | a route matched, but no target accepted the connection |
+| No route | the client asked for a hostname or port that no route serves |
+| No request | the client connected and left without asking for anything (a port probe) |
+
+Each edge keeps its own log **in memory** (the last 4,000 forwarded connections and, separately, the last 2,000 that
+were turned away, so an internet scan can't push real traffic out). Nothing is written to disk and nothing is stored
+on the controller: the Logs page asks the edges when you look, over the same pinned mutual-TLS channel as everything
+else, and merges the answers. A connection is listed **when it ends**, and restarting an edge empties its log. An edge
+that can't be reached is named at the top of the page instead of silently missing. Edges installed before this feature
+report "older than the connection log"; reinstall them to update.
+
+It is a connection log, not a request log: the edge forwards TLS without decrypting it, so it cannot see paths,
+headers or status codes. (That is also why it can't be a web application firewall; see "Not done yet".)
+
+**Map** draws how traffic gets from the internet to your targets: the DNS names, the edges, the routes and the sites
+(or targets reached directly). Colours are the health the other pages show, dashed lines are paths that aren't
+carrying traffic, and each site box lists its tunnel to every edge. Point at a box to trace its path, click it to
+open its page.
+
 ## Security model
 
 - **Controller ⇄ edge** is mutual TLS with a private PKI: the controller owns a CA and signs its own client
@@ -291,6 +319,7 @@ Sign in (`POST /api/login`), then send the cookie plus `X-EdgeLB: 1`.
 | `GET/POST /api/sites` · `PUT/DELETE /api/sites/{id}` · `POST …/{id}/enrol` | sites, and the one-time gateway enrolment command |
 | `GET/POST /api/routes` · `PUT/DELETE /api/routes/{id}` | route + `"edges": [...]` scope (empty = all) + `"site"` (targets inside that site) |
 | `GET/PUT /api/settings` · `GET /api/ssh-key` · `GET /api/audit` · `POST /api/password` | |
+| `GET /api/logs?edge=&route=&outcome=&client=&host=&limit=` | recent connections from the edges, newest first, plus how each edge answered. `outcome` is `ok`, `unreachable`, `no_route`, `aborted` or `rejected`; `limit` is 1–1000 (default 200) |
 
 Errors: `401`, `403` (missing header), `404`, `409`, `422` with `{"details": [...]}`, `429` (lockout).
 
@@ -308,7 +337,7 @@ A listener with domain routes waits `--peek-timeout-ms` (3 s) for the first byte
 
 ## Tests and what was actually exercised
 
-`cargo test` — **107 tests**: unit, protocol sniffing, the proxy over real sockets, the mTLS channel, the
+`cargo test` — **146 tests** on Linux (a few Unix-only ones are skipped on Windows): unit, protocol sniffing, the proxy over real sockets, the mTLS channel, the
 HTTP APIs, and the fleet lifecycle (mock Hetzner + Cloudflare, real controller, real edges, real traffic:
 create, serve, outage, recovery, drain, delete, DNS fail-static, crash-safe adoption, restart resume).
 The SSH bootstrap runs the **real binary** through the real script with a stub `ssh`.
@@ -345,6 +374,10 @@ that follow the documented API), other distros (Ubuntu, Fedora, RHEL/SELinux), I
 - Several gateways per site (failover). Needs an active/standby choice, because two peers can't both own the same
   `AllowedIPs`. IPv6 sites.
 - Upgrading edges installed before WireGuard support in place (today: create them anew).
+- A web application firewall. The edge passes TLS through without decrypting it, so it can't inspect requests;
+  what it can do at the connection level (per-route allow/deny lists, per-client rate limits, GeoIP) is not built yet.
+  Until then, run a WAF behind the gateway and pass it the real client address with PROXY protocol.
+- Keeping the connection log across edge restarts, or exporting it (it is in memory only).
 - Host firewall management on edges (use the provider firewall or `ufw`); a Hetzner Cloud Firewall option.
 - TOTP/2FA; controller high availability (edges keep serving without it); encrypting `controller.json` on Linux (on Windows it is already encrypted with DPAPI).
 - A container image, rolling edge upgrades, more providers (DigitalOcean, Vultr, …), UDP routes, per-region target overrides,

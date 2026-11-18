@@ -154,7 +154,7 @@ impl Controller {
         Some(Target { edge_id: e.id.clone(), ip: e.ip?, ssh_user: e.ssh_user.clone(), ssh_port: e.ssh_port, mgmt_port: e.mgmt_port })
     }
 
-    fn client_for(&self, e: &Edge) -> anyhow::Result<EdgeClient> {
+    pub(crate) fn client_for(&self, e: &Edge) -> anyhow::Result<EdgeClient> {
         let ip = e.ip.ok_or_else(|| anyhow::anyhow!("edge has no IP address"))?;
         let fp = e.mgmt_fingerprint.as_deref().ok_or_else(|| anyhow::anyhow!("edge identity not pinned yet"))?;
         let client = self.store.read(|s| s.client.clone());

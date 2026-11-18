@@ -10,6 +10,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use edge_lbd::config::Route;
 use edge_lbd::controller::bootstrap::{Bootstrapper, InstallCtx, Installed, Target};
+use edge_lbd::controller::logs::LogQuery;
 use edge_lbd::controller::model::{EdgeStatus, ProviderSpec};
 use edge_lbd::controller::{Controller, CtlError, NewEdge, Options, SettingsUpdate};
 use edge_lbd::edge::{self, EdgeHandle, EdgeOptions};
@@ -575,4 +576,77 @@ async fn catalog_hides_deprecated_server_types() {
     assert_eq!(cat.server_types.len(), 1, "deprecated types are hidden");
     assert_eq!(cat.server_types[0].prices[0].monthly, 5.49);
     assert!(edge_lbd::controller::providers::Hetzner::new(&hz_url, "wrong").unwrap().catalog().await.unwrap_err().to_string().contains("token"));
+}
+
+
+async fn logged(ctl: &Controller, edge: &str) -> usize {
+    ctl.access_logs(LogQuery { edge: Some(edge.into()), limit: Some(1000), ..Default::default() }).await.unwrap().entries.len()
+}
+
+#[tokio::test]
+async fn the_controller_gathers_connection_logs_from_every_edge() {
+    let r = rig("logs").await;
+    let backend = echo_backend("OK").await;
+    let (pa, pb) = (free_port().await, free_port().await);
+    r.ctl.create_edge("t", hetzner_edge("US East", "us-east")).unwrap();
+    r.ctl.create_edge("t", hetzner_edge("US West", "us-west")).unwrap();
+    wait_for("both edges healthy", || status_of(&r.ctl, "us-east") == Some(EdgeStatus::Healthy) && status_of(&r.ctl, "us-west") == Some(EdgeStatus::Healthy)).await;
+    r.ctl.create_route("t", croute("east-only", "127.0.0.1", pa, backend, &["us-east"])).unwrap();
+    r.ctl.create_route("t", croute("west-only", "127.0.0.2", pb, backend, &["us-west"])).unwrap();
+    wait_for("both routes live", || fetch_ok(format!("127.0.0.1:{pa}").parse().unwrap()) && fetch_ok(format!("127.0.0.2:{pb}").parse().unwrap())).await;
+
+    // The readiness probes above are connections too. Let them land, then count from there.
+    let (mut base_e, mut base_w) = (logged(&r.ctl, "us-east").await, logged(&r.ctl, "us-west").await);
+    for _ in 0..40 {
+        sleep(Duration::from_millis(100)).await;
+        let (e, w) = (logged(&r.ctl, "us-east").await, logged(&r.ctl, "us-west").await);
+        if (e, w) == (base_e, base_w) {
+            break;
+        }
+        (base_e, base_w) = (e, w);
+    }
+
+    assert_eq!(fetch(format!("127.0.0.1:{pa}").parse().unwrap()).await, "OK");
+    assert_eq!(fetch(format!("127.0.0.2:{pb}").parse().unwrap()).await, "OK");
+    assert_eq!(fetch(format!("127.0.0.2:{pb}").parse().unwrap()).await, "OK");
+    for _ in 0..100 {
+        if logged(&r.ctl, "us-east").await == base_e + 1 && logged(&r.ctl, "us-west").await == base_w + 2 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(logged(&r.ctl, "us-east").await, base_e + 1, "one connection reached east");
+    assert_eq!(logged(&r.ctl, "us-west").await, base_w + 2, "two reached west");
+
+    // The three newest rows are those three connections, newest first, from both edges.
+    let q = |edge: Option<&str>, route: Option<&str>, outcome: Option<&str>| LogQuery { edge: edge.map(Into::into), route: route.map(Into::into), outcome: outcome.map(Into::into), ..Default::default() };
+    let view = r.ctl.access_logs(LogQuery { limit: Some(3), ..Default::default() }).await.unwrap();
+    assert_eq!(view.entries.len(), 3);
+    assert_eq!(view.entries.iter().filter(|e| e.edge == "us-east").count(), 1);
+    assert_eq!(view.entries.iter().filter(|e| e.edge == "us-west").count(), 2);
+    assert!(view.entries.iter().all(|e| e.entry.bytes_down == 2 && e.entry.outcome == edge_lbd::accesslog::Outcome::Ok), "{view:?}");
+    assert!(view.entries.iter().all(|e| e.edge_name.starts_with("US ")), "rows carry the edge's name");
+    assert!(view.entries.windows(2).all(|w| w[0].entry.ts_ms >= w[1].entry.ts_ms), "newest first");
+    assert_eq!(view.sources.len(), 2);
+    assert!(view.sources.iter().all(|s| s.error.is_none()), "{:?}", view.sources);
+
+    // Filters.
+    let west = r.ctl.access_logs(q(Some("us-west"), None, None)).await.unwrap();
+    assert!(west.entries.iter().all(|e| e.edge == "us-west"));
+    assert_eq!(west.sources.len(), 1, "only the edge that was asked");
+    let route = r.ctl.access_logs(q(None, Some("east-only"), None)).await.unwrap();
+    assert!(!route.entries.is_empty() && route.entries.iter().all(|e| e.entry.route.as_deref() == Some("east-only")));
+    assert!(r.ctl.access_logs(q(None, None, Some("rejected"))).await.unwrap().entries.is_empty(), "nothing was turned away");
+    assert!(matches!(r.ctl.access_logs(q(None, None, Some("bogus"))).await, Err(CtlError::Invalid(_))));
+    assert!(matches!(r.ctl.access_logs(q(Some("nowhere"), None, None)).await, Err(CtlError::NotFound(_))));
+
+    // An edge that has stopped answering is reported by name; the rest still show.
+    r.machines.kill("us-east").await;
+    let view = r.ctl.access_logs(LogQuery::default()).await.unwrap();
+    let east = view.sources.iter().find(|s| s.id == "us-east").unwrap();
+    assert!(east.error.is_some(), "a dead edge must be explained, not silently missing: {east:?}");
+    let west = view.sources.iter().find(|s| s.id == "us-west").unwrap();
+    assert!(west.error.is_none() && west.returned > 0);
+    assert!(view.entries.iter().all(|e| e.edge == "us-west"));
+    let _ = std::fs::remove_dir_all(&r.dir);
 }

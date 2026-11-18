@@ -1,12 +1,13 @@
 //! The data plane: accept, (maybe) sniff the hostname, pick a target, forward bytes.
 
+use crate::accesslog::{AccessLog, Closed, Outcome};
 use crate::config::{domain_matches, Route};
 use crate::sniff::{sniff, Sniffed};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -21,6 +22,45 @@ pub struct Tunables {
     /// How long to wait for a client to send enough bytes to identify the hostname.
     pub peek_timeout: Duration,
     pub connect_timeout: Duration,
+    /// Where each finished connection is written down.
+    pub log: Arc<AccessLog>,
+}
+
+/// One connection's entry in the access log. It is written when this is dropped, so every way out
+/// of `handle_conn` (including a task being cancelled) leaves exactly one record.
+struct ConnLog {
+    log: Arc<AccessLog>,
+    started: Instant,
+    client: IpAddr,
+    port: u16,
+    route: Option<String>,
+    host: Option<String>,
+    target: Option<String>,
+    outcome: Outcome,
+    up: AtomicU64,
+    down: AtomicU64,
+}
+
+impl ConnLog {
+    fn new(log: Arc<AccessLog>, client: IpAddr, port: u16) -> Self {
+        Self { log, started: Instant::now(), client, port, route: None, host: None, target: None, outcome: Outcome::Aborted, up: AtomicU64::new(0), down: AtomicU64::new(0) }
+    }
+}
+
+impl Drop for ConnLog {
+    fn drop(&mut self) {
+        self.log.record(Closed {
+            client: self.client,
+            port: self.port,
+            route: self.route.take(),
+            host: self.host.take(),
+            target: self.target.take(),
+            outcome: self.outcome,
+            bytes_up: self.up.load(Relaxed),
+            bytes_down: self.down.load(Relaxed),
+            duration_ms: self.started.elapsed().as_millis() as u64,
+        });
+    }
 }
 
 pub struct TargetState {
@@ -188,7 +228,8 @@ fn keepalive(s: &TcpStream) {
     let _ = socket2::SockRef::from(s).set_tcp_keepalive(&ka);
 }
 
-async fn pump<R, W>(mut r: R, mut w: W, counter: &AtomicU64) -> io::Result<()>
+/// Copy until EOF, counting bytes both on the route (`total`) and on this one connection (`mine`).
+async fn pump<R, W>(mut r: R, mut w: W, total: &AtomicU64, mine: &AtomicU64) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -200,7 +241,8 @@ where
             break;
         }
         w.write_all(&buf[..n]).await?;
-        counter.fetch_add(n as u64, Relaxed);
+        total.fetch_add(n as u64, Relaxed);
+        mine.fetch_add(n as u64, Relaxed);
     }
     w.shutdown().await
 }
@@ -208,6 +250,8 @@ where
 pub async fn handle_conn(mut client: TcpStream, peer: SocketAddr, tbl: Arc<Table>, t: Tunables) {
     let local = client.local_addr().unwrap_or(peer);
     let _ = client.set_nodelay(true);
+    // Written to the access log when this function ends, however it ends.
+    let mut cl = ConnLog::new(t.log.clone(), peer.ip(), local.port());
 
     let mut head = Vec::new();
     let mut host = None;
@@ -220,14 +264,19 @@ pub async fn handle_conn(mut client: TcpStream, peer: SocketAddr, tbl: Arc<Table
             }
         }
     }
+    cl.host = host.clone();
     let Some(rt) = tbl.resolve(host.as_deref()) else {
         debug!(%peer, ?host, "no matching route; closing");
+        // If nothing arrived at all the client never asked for anything (a port probe, say).
+        cl.outcome = if head.is_empty() { Outcome::Aborted } else { Outcome::NoRoute };
         return;
     };
+    cl.route = Some(rt.route.id.clone());
 
     let _active = ActiveGuard::new(&rt.stats);
     let mut upstream = None;
     for tg in rt.attempt_order() {
+        cl.target = Some(tg.addr.to_string());
         match timeout(t.connect_timeout, TcpStream::connect(tg.addr)).await {
             Ok(Ok(s)) => {
                 upstream = Some(s);
@@ -245,8 +294,10 @@ pub async fn handle_conn(mut client: TcpStream, peer: SocketAddr, tbl: Arc<Table
     }
     let Some(mut up) = upstream else {
         warn!(route = %rt.route.id, %peer, "all targets unreachable");
+        cl.outcome = Outcome::Unreachable;
         return;
     };
+    cl.outcome = Outcome::Ok;
     let _ = up.set_nodelay(true);
     keepalive(&client);
     keepalive(&up);
@@ -259,11 +310,12 @@ pub async fn handle_conn(mut client: TcpStream, peer: SocketAddr, tbl: Arc<Table
             return;
         }
         rt.stats.bytes_up.fetch_add(head.len() as u64, Relaxed);
+        cl.up.fetch_add(head.len() as u64, Relaxed);
     }
 
     let (cr, cw) = client.into_split();
     let (ur, uw) = up.into_split();
-    let _ = tokio::try_join!(pump(cr, uw, &rt.stats.bytes_up), pump(ur, cw, &rt.stats.bytes_down));
+    let _ = tokio::try_join!(pump(cr, uw, &rt.stats.bytes_up, &cl.up), pump(ur, cw, &rt.stats.bytes_down, &cl.down));
 }
 
 /// Run the accept loop for one bound socket. Routes can be swapped live via the watch channel.

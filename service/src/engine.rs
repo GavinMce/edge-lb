@@ -1,6 +1,7 @@
 //! The control core: owns the route set, persists it, and reconciles running listeners
 //! and health checkers to match — live, without dropping existing connections.
 
+use crate::accesslog::AccessLog;
 use crate::config::{self, Route, Store};
 use crate::firewall::NftSet;
 use crate::proxy::{spawn_listener, RouteRt, RouteStats, TargetState, Table, Tunables};
@@ -103,6 +104,7 @@ struct Inner {
     opts: Options,
     started: Instant,
     sem: Arc<Semaphore>,
+    log: Arc<AccessLog>,
 }
 
 #[derive(Clone)]
@@ -208,6 +210,11 @@ fn spawn_health(addr: SocketAddr, every: Duration, connect_timeout: Duration) ->
 }
 
 impl Engine {
+    /// Recent connections, for the controller's Logs page.
+    pub fn access_log(&self) -> Arc<AccessLog> {
+        self.inner.log.clone()
+    }
+
     pub async fn start(opts: Options) -> anyhow::Result<Engine> {
         let store = Store::new(opts.data_dir.join("routes.json"));
         let routes = store.load()?;
@@ -229,6 +236,7 @@ impl Engine {
                 state: Mutex::new(State { routes, ..Default::default() }),
                 store,
                 started: Instant::now(),
+                log: Arc::new(AccessLog::new()),
                 opts,
             }),
         };
@@ -302,7 +310,7 @@ impl Engine {
         }
         st.bind_errors.retain(|k, _| groups.contains_key(k));
 
-        let tunables = Tunables { peek_timeout: opts.peek_timeout, connect_timeout: opts.connect_timeout };
+        let tunables = Tunables { peek_timeout: opts.peek_timeout, connect_timeout: opts.connect_timeout, log: self.inner.log.clone() };
         for (key, routes) in groups {
             let table = Arc::new(Table::new(routes));
             if let Some(l) = st.listeners.get(&key) {
