@@ -54,14 +54,81 @@ jobs:
           name: ${{ matrix.arch }}
           path: edge-lbd-*
 
-  publish:
+  windows:
+    name: Build Windows desktop app (MSI)
     needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The app installs *Linux* edges and gateways, so it carries the static builds made above.
+      - uses: actions/download-artifact@v4
+        with:
+          path: linux
+          merge-multiple: true
+      - name: Stage the Linux builds as app resources
+        shell: bash
+        run: |
+          agents=service/desktop/src-tauri/agents
+          mkdir -p "$agents"
+          for arch in x86_64 aarch64; do
+            name="edge-lbd-${GITHUB_REF_NAME}-linux-${arch}"
+            (cd linux && sha256sum -c "$name.tar.gz.sha256" && tar xzf "$name.tar.gz")
+            cp "linux/$name/edge-lbd" "$agents/edge-lbd-$arch"
+          done
+          ls -l "$agents"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: service
+          key: windows-desktop
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: service/desktop/package-lock.json
+      - name: Build the MSI
+        working-directory: service/desktop
+        shell: bash
+        run: |
+          # MSI versions are numeric: v1.2.3 (or v1.2.3-rc1) -> 1.2.3
+          version="${GITHUB_REF_NAME#v}"
+          version="${version%%-*}"
+          npm ci
+          npx tauri build --config "{\"version\":\"$version\"}" -- --locked
+      - name: Package
+        shell: bash
+        run: |
+          name="edge-lb-${GITHUB_REF_NAME}-windows-x64.msi"
+          cp service/target/release/bundle/msi/*.msi "$name"
+          sha256sum "$name" > "$name.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: edge-lb-*
+
+  publish:
+    needs: [build, windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      # The one-line server install (shown in the desktop app) downloads this script from the
+      # release and it installs exactly this release, so the tag and repository are baked in.
+      - name: Stamp the server installer
+        run: |
+          case "$GITHUB_REF_NAME" in
+            v[0-9]*) ;;
+            *) echo "release tags must look like v1.2.3 (got $GITHUB_REF_NAME)"; exit 1 ;;
+          esac
+          printf '%s' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9][0-9A-Za-z.+_-]{0,40}$'
+          sed -e "s|@VERSION@|$GITHUB_REF_NAME|" -e "s|@REPO@|$GITHUB_REPOSITORY|g" \
+            service/deploy/install-controller.sh > dist/install-controller.sh
+          if grep -q '@VERSION@\|@REPO@' dist/install-controller.sh; then echo "unreplaced placeholder"; exit 1; fi
+          sh -n dist/install-controller.sh
+          (cd dist && sha256sum install-controller.sh > install-controller.sh.sha256)
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
