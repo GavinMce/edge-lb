@@ -90,8 +90,8 @@ machine's CPU over SSH and uploads the matching build; a gateway's install comma
   tokens) is encrypted with your Windows login (DPAPI), so a copy is useless on another account or machine.
   The controller's SSH private key is a normal file in `ssh\`; Windows `ssh-keygen` gives it the ACL OpenSSH
   requires (your account, Administrators and SYSTEM).
-- **Gateways on your LAN** must reach the controller: pass `--gateway-listen 0.0.0.0:7444 --gateway-host <this PC's LAN IP>`
-  and allow the Windows Firewall prompt.
+- **Gateways on your LAN** must reach the controller: turn the listener on in **Settings → Gateways** (the form
+  is pre-filled with this PC's LAN address), and allow the Windows Firewall prompt.
 - **Tested on Windows 11:** the build, the full test suite, DPAPI, the data-folder ACL, SSH key creation and the
   `ssh` option quoting. **Not yet tested:** adopting or creating a real machine end to end from Windows.
 
@@ -122,8 +122,10 @@ startup = "ask"            # "ask" shows the launcher; "local"; or the name of a
 [local]
 port = 17480
 data_dir = ""              # default: this folder
-gateway_listen = "0.0.0.0:7444"     # for WireGuard gateways on your LAN: set both, or neither,
-gateway_host   = "192.168.1.20"     # and allow the Windows Firewall prompt
+# Optional: pin the gateway listener here (both keys, or neither). It is then fixed and shows read-only in
+# the controller's Settings. Leave them out and turn it on from Settings → Gateways instead.
+# gateway_listen = "0.0.0.0:7444"
+# gateway_host   = "192.168.1.20"
 ```
 
 `remotes.toml` is the saved list; the app maintains it (and you may edit it). A mistake in `app.toml` never
@@ -170,14 +172,24 @@ The controller allocates every node a tunnel address (default `10.100.0.0/24`, c
 creating sites), exchanges **public** keys, and keeps every edge's and gateway's tunnel config in step as edges
 come and go. **Private keys are generated on the machine that uses them and never travel.**
 
-Start the controller with the gateway listener (off by default, so a plain controller exposes nothing extra; the
-Sites page tells you when it's missing). The controller learns how it is run from `EDGE_LB_DEPLOYMENT`
-(`desktop` or `server`, set by the desktop app and the installer) and words that help accordingly:
+The gateway listener is off by default, so a plain controller exposes nothing extra. Turn it on in
+**Settings → Gateways** (the Sites page and the gateway dialog link there, and the dialog carries straight on to the
+command): the address to listen on (default `0.0.0.0:7444`) and the host name or IPv4 address gateways dial
+(pre-filled with this machine's address on its network). It starts listening at once, with no restart, is saved in
+`controller.json`, and comes back after a restart. If the new address can't be bound the old listener keeps running
+and the error is shown. Changing the address gateways dial doesn't reach gateways already installed (their command
+has the old one): re-enrol them.
+
+Or fix it at startup, which makes it read-only in Settings (and is what the desktop app's `app.toml` keys and the
+installer's `--gateway-listen` do):
 
 ```sh
 edge-lbd controller --listen 127.0.0.1:8080 \
     --gateway-listen 0.0.0.0:7444 --gateway-host ctl.example.com     # host or IPv4 gateways will dial
 ```
+
+The controller learns how it is run from `EDGE_LB_DEPLOYMENT` (`desktop` or `server`, set by the desktop app and
+the installer) and words the firewall reminder accordingly.
 
 Nothing stops the controller running on an edge's VPS (the ports differ: 7443 edge management, 7444 gateways, the UI
 on loopback), but that combination hasn't been tested. Open **TCP 7444** (controller, for gateways) and **UDP 51820**

@@ -160,6 +160,17 @@ pub struct Settings {
     /// UDP port every edge listens on for WireGuard.
     #[serde(default = "default_wg_port")]
     pub wg_port: u16,
+    /// Where WireGuard gateways dial this controller. Off unless set (here or on the command line).
+    #[serde(default)]
+    pub gateway: Option<GatewaySetting>,
+}
+
+/// `listen` is the local `ip:port` to bind; `host` is the name or IPv4 address (optionally `:port`)
+/// that gateways are told to dial, which differs from `listen` behind NAT or a proxy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatewaySetting {
+    pub listen: String,
+    pub host: String,
 }
 
 pub fn default_wg_network() -> String {
@@ -180,6 +191,7 @@ impl Default for Settings {
             drain_seconds: 60,
             wg_network: default_wg_network(),
             wg_port: default_wg_port(),
+            gateway: None,
         }
     }
 }

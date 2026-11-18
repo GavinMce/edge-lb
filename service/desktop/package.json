@@ -1,7 +1,7 @@
 {
   "name": "edge-lb-desktop",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Build tooling for the edge-lb Windows app (Tauri CLI only; there is no JavaScript frontend)",
   "scripts": {
     "tauri": "tauri"

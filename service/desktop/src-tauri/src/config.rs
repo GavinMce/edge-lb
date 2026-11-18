@@ -30,8 +30,10 @@ pub struct LocalConfig {
     pub port: u16,
     /// Where the local controller keeps its state. Default: the app's folder.
     pub data_dir: Option<PathBuf>,
-    /// Let WireGuard gateways on your LAN reach this PC: `gateway_listen = "0.0.0.0:7444"` and
-    /// `gateway_host = "192.168.1.20"` (this PC's address as the gateways see it). Both or neither.
+    /// Optional: pin the gateway listener, `gateway_listen = "0.0.0.0:7444"` with
+    /// `gateway_host = "192.168.1.20"` (this PC's address as gateways see it). Both or neither. When
+    /// set it is fixed and read-only in the controller's Settings; leave both out to turn it on from
+    /// Settings → Gateways instead, which needs no restart.
     pub gateway_listen: Option<SocketAddr>,
     pub gateway_host: Option<String>,
 }

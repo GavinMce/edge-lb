@@ -150,6 +150,10 @@ pub struct Controller {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) gateway: Mutex<Option<GatewayEndpoint>>,
     pub(crate) gateway_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Why a *saved* gateway listener isn't running (e.g. its port is taken); shown in Settings.
+    pub(crate) gateway_error: Mutex<Option<String>>,
+    /// Serialises changes to the listener so two requests can't interleave stop and start.
+    pub(crate) gateway_op: tokio::sync::Mutex<()>,
     pub(crate) gw_live: RwLock<HashMap<String, GwLive>>,
 }
 
@@ -197,6 +201,45 @@ pub struct SettingsUpdate {
     pub dns: Option<DnsUpdate>,
     #[serde(default)]
     pub clear_dns: bool,
+    /// Turn the gateway listener on (or change it). Applied immediately; see `Controller::set_gateway`.
+    pub gateway: Option<GatewayUpdate>,
+    #[serde(default)]
+    pub clear_gateway: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayUpdate {
+    pub listen: String,
+    pub host: String,
+}
+
+impl SettingsUpdate {
+    /// Nothing but the gateway listener is being changed.
+    fn only_gateway(&self) -> bool {
+        self.max_edges.is_none()
+            && self.hetzner_token.is_none()
+            && self.hetzner_image.is_none()
+            && self.drain_seconds.is_none()
+            && self.wg_network.is_none()
+            && self.wg_port.is_none()
+            && self.dns.is_none()
+            && !self.clear_dns
+    }
+}
+
+/// The gateway listener as the UI shows it.
+#[derive(Debug, Serialize)]
+pub struct GatewayInfo {
+    pub listen: Option<String>,
+    pub host: Option<String>,
+    /// Fixed by the startup options (command line, `app.toml`, the installer); can't be changed here.
+    pub locked: bool,
+    /// What gateways are told to dial (`host:port`), while the listener is up.
+    pub active: Option<String>,
+    /// Why a saved listener isn't running, if it isn't.
+    pub error: Option<String>,
+    /// This machine's address on its default route: a starting point for `host`.
+    pub suggested_host: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +260,7 @@ pub struct SettingsView {
     pub wg_network: String,
     pub wg_port: u16,
     pub dns: Option<DnsView>,
+    pub gateway: GatewayInfo,
 }
 
 /// Routes into a site must stay inside it, and routes that don't name a site must stay out of
@@ -277,6 +321,8 @@ impl Controller {
             task: Mutex::new(None),
             gateway: Mutex::new(None),
             gateway_task: Mutex::new(None),
+            gateway_error: Mutex::new(None),
+            gateway_op: tokio::sync::Mutex::new(()),
             gw_live: RwLock::new(HashMap::new()),
             opts,
         });
@@ -285,7 +331,18 @@ impl Controller {
             c.store.update(|s| s.gateway_tls = Some(pem))?;
         }
         if let Some(g) = c.opts.gateway.clone() {
+            // Given on the command line: failing to listen is a startup error, as before.
             c.start_gateway_listener(&g).await?;
+        } else if let Some(saved) = c.store.read(|s| s.settings.gateway.clone()) {
+            // Saved from Settings: a taken port must not stop the controller, it is reported there instead.
+            let started = match sites::parse_gateway(&saved.listen, &saved.host) {
+                Ok(g) => c.start_gateway_listener(&g).await.map_err(|e| format!("{e:#}")),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = started {
+                tracing::warn!("the saved gateway listener could not start: {e}");
+                *c.gateway_error.lock().unwrap() = Some(e);
+            }
         }
         if c.store.read(|s| s.admin.is_none()) {
             use rand::Rng;
@@ -348,7 +405,25 @@ impl Controller {
             wg_network: s.settings.wg_network.clone(),
             wg_port: s.settings.wg_port,
             dns: s.settings.dns.as_ref().map(|d| DnsView { zone_id: d.zone_id.clone(), names: d.names.clone(), ttl: d.ttl, token_set: !d.cloudflare_token.is_empty() }),
+            gateway: self.gateway_info(s.settings.gateway.as_ref()),
         })
+    }
+
+    fn gateway_info(&self, saved: Option<&model::GatewaySetting>) -> GatewayInfo {
+        let locked = self.opts.gateway.is_some();
+        let (listen, host) = match (&self.opts.gateway, saved) {
+            (Some(g), _) => (Some(g.listen.to_string()), Some(g.host.clone())),
+            (None, Some(s)) => (Some(s.listen.clone()), Some(s.host.clone())),
+            (None, None) => (None, None),
+        };
+        GatewayInfo {
+            listen,
+            host,
+            locked,
+            active: self.gateway_endpoint().map(|g| g.hostport),
+            error: self.gateway_error.lock().unwrap().clone(),
+            suggested_host: sites::default_route_address(),
+        }
     }
 
     /// Locations and server types for the "add edge" form. `compatible` marks types whose CPU

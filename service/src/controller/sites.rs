@@ -9,7 +9,7 @@
 //! admin credentials and the admin UI are never exposed there.
 
 use super::model::*;
-use super::{invalid, Controller, CtlError};
+use super::{invalid, Controller, CtlError, GatewayUpdate};
 use crate::gateway::{EnrolReq, EnrolResp, Handshake, SyncReq, SyncResp};
 use crate::wg::{self, Cidr};
 use crate::{config, pki, tls};
@@ -44,6 +44,30 @@ pub struct GatewayEndpoint {
     pub addr: SocketAddr,
     /// `host:port` as a gateway should dial it.
     pub hostport: String,
+}
+
+/// Check what was typed into Settings (or saved earlier) and turn it into a listener to start.
+pub fn parse_gateway(listen: &str, host: &str) -> Result<GatewayListen, String> {
+    let (listen, host) = (listen.trim(), host.trim());
+    let addr: SocketAddr = listen.parse().map_err(|_| "the listen address must be an IP address and a port, like 0.0.0.0:7444".to_string())?;
+    if addr.port() == 0 {
+        return Err("the listen port must be between 1 and 65535".into());
+    }
+    if !valid_hostport(host) {
+        return Err("the address gateways dial must be a host name or an IPv4 address, optionally with :port (like 192.168.1.20 or ctl.example.com)".into());
+    }
+    Ok(GatewayListen { listen: addr, host: host.to_string() })
+}
+
+/// This machine's IPv4 address on its default route, as a suggestion for the address gateways
+/// should dial. Nothing is sent: connecting a UDP socket only makes the OS pick a route.
+pub fn default_route_address() -> Option<String> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v) if !v.is_unspecified() && !v.is_loopback() => Some(v.to_string()),
+        _ => None,
+    }
 }
 
 pub fn valid_hostport(s: &str) -> bool {
@@ -332,7 +356,7 @@ impl Controller {
     /// Issue a one-time token and the command that installs and enrols a gateway with it.
     pub fn start_enrolment(&self, actor: &str, id: &str) -> Result<EnrolInfo, CtlError> {
         let ep = self.gateway_endpoint().ok_or_else(|| {
-            CtlError::Invalid(vec!["gateways can't connect yet: start the controller with --gateway-listen <addr> --gateway-host <public hostname or IP>".into()])
+            CtlError::Invalid(vec!["gateways can't connect yet: turn on the gateway listener in Settings (or start the controller with --gateway-listen <addr> --gateway-host <public hostname or IP>)".into()])
         })?;
         let pin = self.store.read(|s| s.gateway_tls.as_ref().map(|p| pki::spki_pin(&p.key))).ok_or_else(|| CtlError::Internal("no gateway certificate".into()))??;
         let token = random_hex(32);
@@ -439,10 +463,63 @@ impl Controller {
         tokio::fs::read(path).await.map_err(|e| GwError::Internal(format!("reading the binary to serve: {e}")))
     }
 
+    /// Turn the gateway listener on, change it, or (with `None`) turn it off, without a restart.
+    ///
+    /// The old listener is stopped first so its port can be reused; if the new one can't start, the
+    /// old one is put back and the setting is left as it was. Not available when the listener was
+    /// given on the command line, so there is never a question of which one wins.
+    pub async fn set_gateway(self: &Arc<Self>, actor: &str, update: Option<GatewayUpdate>) -> Result<(), CtlError> {
+        let _op = self.gateway_op.lock().await;
+        if self.opts.gateway.is_some() {
+            return Err(CtlError::Conflict("the gateway listener is fixed by this controller's startup options (command line, app.toml or the installer); change it there".into()));
+        }
+        let wanted = match &update {
+            Some(u) => Some(parse_gateway(&u.listen, &u.host).map_err(|e| CtlError::Invalid(vec![e]))?),
+            None => None,
+        };
+        let previous = self.store.read(|s| s.settings.gateway.clone()).and_then(|p| parse_gateway(&p.listen, &p.host).ok());
+
+        self.stop_gateway_listener().await;
+        if let Some(g) = &wanted {
+            if let Err(e) = self.start_gateway_listener(g).await {
+                if let Some(p) = &previous {
+                    let _ = self.start_gateway_listener(p).await;
+                }
+                return Err(CtlError::Invalid(vec![format!("{e:#}")]));
+            }
+        }
+        let saved = wanted.as_ref().map(|g| GatewaySetting { listen: g.listen.to_string(), host: g.host.clone() });
+        if let Err(e) = self.store.update(|s| s.settings.gateway = saved.clone()) {
+            self.stop_gateway_listener().await;
+            if let Some(p) = &previous {
+                let _ = self.start_gateway_listener(p).await;
+            }
+            return Err(CtlError::Internal(format!("saving the setting: {e:#}")));
+        }
+        *self.gateway_error.lock().unwrap() = None;
+        let detail = match &wanted {
+            Some(g) => format!("gateway listener on {}, gateways dial {}", g.listen, g.host),
+            None => "gateway listener turned off".to_string(),
+        };
+        self.audit.record(actor, "gateway.listener", &detail);
+        Ok(())
+    }
+
+    /// Stop listening for gateways and wait until the socket is really closed, so the same port can
+    /// be bound again straight away. Connections already being served finish on their own.
+    pub(crate) async fn stop_gateway_listener(&self) {
+        let task = self.gateway_task.lock().unwrap().take();
+        *self.gateway.lock().unwrap() = None;
+        if let Some(t) = task {
+            t.abort();
+            let _ = t.await;
+        }
+    }
+
     pub(crate) async fn start_gateway_listener(self: &Arc<Self>, g: &GatewayListen) -> anyhow::Result<()> {
         use anyhow::Context;
         if !valid_hostport(&g.host) {
-            anyhow::bail!("--gateway-host '{}' must be a hostname or IPv4 address, optionally with :port", g.host);
+            anyhow::bail!("the gateway host '{}' must be a hostname or IPv4 address, optionally with :port", g.host);
         }
         let (cert, key) = self.store.read(|s| s.gateway_tls.as_ref().map(|p| (p.cert.clone(), p.key.clone()))).context("no gateway certificate")?;
         let cfg = tls::gateway_server_config(&cert, &key)?;

@@ -163,6 +163,46 @@ async fn status_says_how_the_controller_is_run_so_the_ui_can_explain_gateway_set
 }
 
 #[tokio::test]
+async fn the_gateway_listener_is_set_through_the_settings_api() {
+    let r = start("gwapi").await;
+    let ck = signed_in(&r).await;
+    let p = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let put = |body: Value| api(&r, &ck, "PUT", "/api/settings", Some(body));
+
+    // Changing it needs the CSRF header like every other write.
+    let no_csrf = http(r.addr, "PUT", "/api/settings", Opts { cookie: Some(&ck), body: Some(json!({"clear_gateway": true})), ..Default::default() }).await;
+    assert_eq!(no_csrf.status, 403);
+
+    let s = api(&r, &ck, "GET", "/api/settings", None).await.json();
+    assert!(s["gateway"]["listen"].is_null() && s["gateway"]["active"].is_null(), "{s}");
+    assert_eq!(s["gateway"]["locked"], false);
+
+    let on = put(json!({"gateway": {"listen": format!("127.0.0.1:{p}"), "host": "h.example.com"}})).await;
+    assert_eq!(on.status, 200, "{}", on.body);
+    assert_eq!(on.json()["gateway"]["active"], format!("h.example.com:{p}"));
+    let st = api(&r, &ck, "GET", "/api/status", None).await.json();
+    assert_eq!(st["gateway_listener"], format!("h.example.com:{p}"), "the Sites page sees it at once");
+
+    let bad = put(json!({"gateway": {"listen": "nope", "host": "h.example.com"}})).await;
+    assert_eq!(bad.status, 422, "{}", bad.body);
+    assert!(bad.body.contains("listen address"), "{}", bad.body);
+    assert_eq!(put(json!({"gateway": {"listen": format!("127.0.0.1:{p}"), "host": "h.example.com"}, "clear_gateway": true})).await.status, 422);
+
+    // Other settings are unaffected by, and don't affect, the listener.
+    assert_eq!(put(json!({"max_edges": 7})).await.status, 200);
+    let s = api(&r, &ck, "GET", "/api/settings", None).await.json();
+    assert_eq!((s["max_edges"].as_u64(), s["gateway"]["active"].as_str().map(str::to_string)), (Some(7), Some(format!("h.example.com:{p}"))));
+
+    let off = put(json!({"clear_gateway": true})).await;
+    assert_eq!(off.status, 200, "{}", off.body);
+    assert!(off.json()["gateway"]["active"].is_null());
+    let st = api(&r, &ck, "GET", "/api/status", None).await.json();
+    assert!(st["gateway_listener"].is_null());
+    let log = api(&r, &ck, "GET", "/api/audit", None).await.json().to_string();
+    assert!(log.contains("gateway.listener") && !log.contains("nope"), "recorded in the activity log: {log}");
+}
+
+#[tokio::test]
 async fn sessions_csrf_logout_and_password_change() {
     let r = start("session").await;
     let ck = signed_in(&r).await;
