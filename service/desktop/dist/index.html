@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>edge-lb</title>
+<link rel="stylesheet" href="launcher.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>edge-lb</h1>
+    <p class="muted">Choose the controller to manage. Your edges keep serving whichever you pick, or if you quit.</p>
+  </header>
+
+  <div id="notice" class="banner" role="alert" hidden></div>
+
+  <div class="panes">
+    <section class="pane" aria-labelledby="local-h">
+      <h2 id="local-h">This PC</h2>
+      <p class="muted">Run the controller here. Its data stays in a folder only your Windows account can open.</p>
+      <dl id="local-facts" class="facts"></dl>
+      <div id="local-error" class="err" role="alert" hidden></div>
+      <div class="actions"><button id="start-local" class="primary" type="button">Start local controller</button></div>
+    </section>
+
+    <section class="pane" aria-labelledby="remote-h">
+      <h2 id="remote-h">Another machine</h2>
+      <p class="muted">Connect to a controller running on a server, a Pi, or another PC.</p>
+      <ul id="remotes" class="remotes"></ul>
+      <p id="no-remotes" class="empty" hidden>No saved controllers yet.</p>
+
+      <form id="remote-form" autocomplete="off">
+        <h3>Connect to a new one</h3>
+        <label class="field"><span>Address</span>
+          <input id="r-url" type="text" inputmode="url" spellcheck="false" placeholder="edge.example.com or http://192.168.1.20:8080" required></label>
+        <label class="field"><span>Name <small class="muted">(optional)</small></span>
+          <input id="r-name" type="text" maxlength="60" placeholder="Home server"></label>
+        <p class="hint">https is required, except for addresses on a private network. A controller listening only on its own loopback can be reached through an SSH tunnel; connect to the tunnel's http://127.0.0.1 port.</p>
+        <div id="remote-error" class="err" role="alert" hidden></div>
+        <div class="actions"><button id="connect-new" class="primary" type="submit">Connect</button></div>
+      </form>
+    </section>
+  </div>
+
+  <details id="setup" class="pane setup">
+    <summary>Set up a controller on a server</summary>
+    <p class="muted">Get a command to paste on a Linux server that installs the controller there, plus the steps to reach it from this PC. Nothing is sent from here; this only writes the commands.</p>
+    <form id="setup-form" autocomplete="off">
+      <label class="field"><span>How will you reach it from this PC?</span>
+        <select id="s-access">
+          <option value="tunnel">Through an SSH tunnel (nothing exposed; simplest)</option>
+          <option value="private">On a private network address (LAN, Tailscale)</option>
+          <option value="proxy">HTTPS, through a reverse proxy I run on the server</option>
+        </select></label>
+      <label class="field" data-for="tunnel"><span>How you log in to the server</span>
+        <input id="s-login" type="text" spellcheck="false" placeholder="root@203.0.113.10"></label>
+      <label class="field" data-for="private" hidden><span>The server's private IP address</span>
+        <input id="s-private" type="text" spellcheck="false" placeholder="192.168.1.20"></label>
+      <label class="field" data-for="proxy" hidden><span>Domain name it will be served on</span>
+        <input id="s-domain" type="text" spellcheck="false" placeholder="ctl.example.com"></label>
+      <label class="check"><input id="s-gateways" type="checkbox"> Let WireGuard gateways on my home network connect to it</label>
+      <label class="field" id="s-gw-wrap" hidden><span>Address the gateways will dial <small class="muted">(blank: the server's address above)</small></span>
+        <input id="s-gwhost" type="text" spellcheck="false" placeholder="vps.example.com or 198.51.100.7"></label>
+      <label class="check"><input id="s-root" type="checkbox"> I'm logged in as root on the server (no sudo)</label>
+      <div id="setup-error" class="err" role="alert" hidden></div>
+      <div class="actions"><button id="setup-go" class="primary" type="submit">Show the commands</button></div>
+    </form>
+    <ol id="setup-steps" class="steps" hidden></ol>
+    <div id="setup-connect" class="connect" hidden>
+      <span>Then connect to</span> <code id="setup-url"></code>
+      <button id="setup-use" class="small" type="button">Use this address above</button>
+    </div>
+  </details>
+</main>
+<script src="launcher.js"></script>
+</body>
+</html>

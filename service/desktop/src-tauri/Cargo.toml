@@ -1,0 +1,30 @@
+[package]
+name = "edge-lb-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "edge-lb controller as a Windows desktop app"
+publish = false
+repository = "https://github.com/GavinMce/edge-lb"
+
+[[bin]]
+name = "edge-lb"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+edge-lbd = { path = "../.." }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "2.12.6", features = ["tray-icon"] }
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-single-instance = "2.5.5"
+tokio = { version = "1.54.1", features = ["sync", "time"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+url = "2.5.8"
+
+[build-dependencies]
+tauri-build = { version = "2.7.5", features = [] }
+

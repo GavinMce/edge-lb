@@ -361,3 +361,17 @@ pub fn router(ctl: Arc<Controller>, secure_cookies: bool) -> Router {
         .nest("/api", protected.merge(open))
         .with_state(st)
 }
+
+/// Serve the UI and API on `listener` until `shutdown` resolves, then stop the controller's
+/// background work. The CLI and the desktop app both run the controller through this.
+pub async fn serve(
+    ctl: Arc<Controller>,
+    listener: tokio::net::TcpListener,
+    secure_cookies: bool,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let app = router(ctl.clone(), secure_cookies).into_make_service_with_connect_info::<SocketAddr>();
+    let res = axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+    ctl.stop();
+    res
+}
