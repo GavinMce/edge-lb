@@ -13,6 +13,7 @@ use edge_lbd::gateway::{self, Handshake, HostWg};
 use edge_lbd::wg::{self, Desired, Peer};
 use edge_lbd::{pki, tls};
 use serde_json::{json, Value};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -86,6 +87,12 @@ fn pinned_http(ctl: &Controller) -> (reqwest::Client, String, String) {
     let fp = pki::fingerprint_pem(&pem.cert).unwrap();
     let http = reqwest::Client::builder().use_preconfigured_tls(tls::pinned_client_config_no_auth(&fp).unwrap()).build().unwrap();
     (http, ctl.gateway_endpoint().unwrap().hostport, fp)
+}
+
+/// The controller's saved state as JSON text, read the way the controller reads it (so it works
+/// where `controller.json` is encrypted at rest, i.e. on Windows).
+fn saved_state(dir: &Path) -> Vec<u8> {
+    edge_lbd::controller::store::Store::open(dir).unwrap().read(|s| serde_json::to_vec(s).unwrap())
 }
 
 fn token_of(command: &str) -> String {
@@ -182,7 +189,7 @@ async fn enrolment_tokens_are_single_use_expire_and_reveal_nothing() {
     assert_eq!(script.status(), 200);
     let script = script.text().await.unwrap();
     assert!(script.contains(&format!("--pin {fp}")) && script.contains(&token) && !script.contains('@'));
-    assert!(!std::fs::read_to_string(_d.join("ctl/controller.json")).unwrap().contains(&token), "token stored in clear");
+    assert!(!String::from_utf8(saved_state(&_d.join("ctl"))).unwrap().contains(&token), "token stored in clear");
     let bin = http.get(format!("https://{host}/gw/binary/{token}/x86_64")).send().await.unwrap();
     assert_eq!(bin.bytes().await.unwrap().as_ref(), b"#!fake-binary");
     // Only architectures the controller really has; the name is looked up, never used as a path.
@@ -207,7 +214,7 @@ async fn enrolment_tokens_are_single_use_expire_and_reveal_nothing() {
     assert_eq!(ok.status(), 200);
     let body: Value = ok.json().await.unwrap();
     assert_eq!(body["secret"].as_str().unwrap().len(), 64);
-    assert!(!std::fs::read_to_string(_d.join("ctl/controller.json")).unwrap().contains(body["secret"].as_str().unwrap()), "secret stored in clear");
+    assert!(!String::from_utf8(saved_state(&_d.join("ctl"))).unwrap().contains(body["secret"].as_str().unwrap()), "secret stored in clear");
     let g = &ctl.sites()[0].gateway;
     assert!(g.enrolled && g.public_key.as_deref() == Some(K_GW) && g.enrol_pending_until.is_none());
 
@@ -311,6 +318,7 @@ async fn gateway_enrols_receives_its_peers_and_tracks_edges_coming_and_going() {
 
     wait_for("enrolled", || ctl.sites()[0].gateway.enrolled).await;
     wait_for("the token file is consumed and the identity saved", || !gwdir.join("enrol-token").exists() && gwdir.join("identity.json").exists()).await;
+    #[cfg(unix)]
     assert_eq!(std::fs::metadata(gwdir.join("identity.json")).unwrap().permissions().mode() & 0o777, 0o600);
 
     wait_for("first tunnel config applied", || !host.applied.lock().unwrap().is_empty()).await;
@@ -506,7 +514,9 @@ async fn edge_state_persists_in_the_controller_json_shape_for_old_controllers() 
         .unwrap();
         c.stop();
     }
-    let mut v: Value = serde_json::from_slice(&std::fs::read(ctl_dir.join("controller.json")).unwrap()).unwrap();
+    // Rewritten below as plain JSON, which is also how an older version would have left it (on
+    // Windows the file is otherwise encrypted, and plain JSON must still be accepted).
+    let mut v: Value = serde_json::from_slice(&saved_state(&ctl_dir)).unwrap();
     let obj = v.as_object_mut().unwrap();
     obj.remove("sites");
     obj.remove("gateway_tls");

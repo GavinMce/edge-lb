@@ -4,6 +4,9 @@
 //! Only the transport is faked: a stub `ssh` runs the remote command locally, and the installer
 //! runs in its "staged" mode (no root, no systemd) under a scratch directory. The systemd unit
 //! itself is covered by a syntax check in the unit tests, not executed here.
+//!
+//! Unix only: the stub `ssh` is a shell script and the staged installer is a POSIX shell script.
+#![cfg(unix)]
 
 use edge_lbd::controller::agents::Agents;
 use edge_lbd::controller::bootstrap::{Bootstrapper, SshBootstrapper, SshKey, Target};
