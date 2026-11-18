@@ -7,6 +7,7 @@ pub mod edge;
 pub mod edge_client;
 pub mod engine;
 pub mod firewall;
+pub mod fsutil;
 pub mod gateway;
 pub mod pki;
 pub mod proxy;

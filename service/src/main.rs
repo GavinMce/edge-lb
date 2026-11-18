@@ -1,10 +1,11 @@
+// Edge, gateway and standalone modes are Linux-only; on other platforms their code is compiled but unused.
+#![cfg_attr(not(unix), allow(dead_code))]
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use edge_lbd::engine::{Engine, Options};
 use edge_lbd::firewall::NftSet;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,13 +84,19 @@ struct ControllerArgs {
     secure_cookies: bool,
 
     /// State directory: controller.json (holds secrets), SSH key, audit log.
-    #[arg(long, env = "EDGE_LB_CONTROLLER_DIR", default_value = "/var/lib/edge-lb-controller")]
+    /// Default: %APPDATA%\edge-lb on Windows, /var/lib/edge-lb-controller elsewhere.
+    #[arg(long, env = "EDGE_LB_CONTROLLER_DIR", default_value_os_t = default_controller_dir())]
     data_dir: PathBuf,
 
-    /// The edge binary installed on new machines (default: this executable). It must match the
-    /// target's OS and CPU; a static (musl) build runs anywhere.
+    /// The edge binary installed on machines with this controller's own CPU (default: this
+    /// executable, on Linux). It must be a Linux build; a static (musl) build runs anywhere.
     #[arg(long, env = "EDGE_LB_EDGE_BINARY")]
     edge_binary: Option<PathBuf>,
+
+    /// Directory with Linux builds to install, named edge-lbd-x86_64 and edge-lbd-aarch64.
+    /// Default: `agents` next to this executable. The Windows app ships its builds there.
+    #[arg(long, env = "EDGE_LB_AGENTS_DIR")]
+    agents_dir: Option<PathBuf>,
 
     /// Where WireGuard gateways connect (TLS, pinned by them; only enrolment and sync live here).
     /// Off unless set. Typically 0.0.0.0:7444 on a public machine.
@@ -199,10 +206,9 @@ fn load_token(path: &Path) -> Result<String> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            let mut f = std::fs::OpenOptions::new()
+            let mut f = edge_lbd::fsutil::private_options()
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
                 .open(path)
                 .with_context(|| format!("creating {}", path.display()))?;
             writeln!(f, "{token}")?;
@@ -245,26 +251,42 @@ async fn standalone(args: StandaloneArgs) -> Result<()> {
     info!("web UI and API on http://{}", args.api);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending().await } } => {}
-            }
-            info!("shutting down");
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     engine.shutdown().await;
     Ok(())
 }
 
+/// Resolves on Ctrl+C, and on SIGTERM (Unix) or the console being closed (Windows).
 async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending().await } } => {}
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending().await } } => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut close = tokio::signal::windows::ctrl_close().ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async { match close.as_mut() { Some(c) => { c.recv().await; } None => std::future::pending().await } } => {}
+        }
     }
     info!("shutting down");
+}
+
+/// Where the controller keeps its state when `--data-dir` isn't given.
+fn default_controller_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("edge-lb");
+        }
+    }
+    PathBuf::from("/var/lib/edge-lb-controller")
 }
 
 async fn edge(args: EdgeArgs) -> Result<()> {
@@ -297,7 +319,15 @@ async fn controller(args: ControllerArgs) -> Result<()> {
     }
     let mut opts = edge_lbd::controller::Options::new(args.data_dir);
     if let Some(b) = args.edge_binary {
-        opts.edge_binary = b;
+        opts.agents.insert(std::env::consts::ARCH, b);
+    }
+    if let Some(d) = &args.agents_dir {
+        opts.agents.discover(d);
+    }
+    if opts.agents.is_empty() {
+        tracing::warn!("no Linux edge binaries found (looked for `agents/edge-lbd-<arch>` beside this program): edges and gateways can't be installed until you pass --agents-dir or --edge-binary");
+    } else {
+        info!("can install edges and gateways for: {}", opts.agents.archs().join(", "));
     }
     if let (Some(listen), Some(host)) = (args.gateway_listen, args.gateway_host) {
         opts.gateway = Some(edge_lbd::controller::sites::GatewayListen { listen, host });
@@ -351,9 +381,15 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().cmd {
         Cmd::Controller(a) => controller(a).await,
+        #[cfg(unix)]
         Cmd::Edge(a) => edge(a).await,
+        #[cfg(unix)]
         Cmd::Standalone(a) => standalone(a).await,
+        #[cfg(unix)]
         Cmd::Gateway(a) => gateway(a).await,
+        #[cfg(unix)]
         Cmd::WgApply(a) => wg_apply(a).await,
+        #[cfg(not(unix))]
+        _ => bail!("only `controller` runs on this platform: edges, gateways and standalone mode are Linux-only. The controller installs them on your Linux machines for you."),
     }
 }

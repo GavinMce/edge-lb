@@ -5,6 +5,7 @@
 //! runs in its "staged" mode (no root, no systemd) under a scratch directory. The systemd unit
 //! itself is covered by a syntax check in the unit tests, not executed here.
 
+use edge_lbd::controller::agents::Agents;
 use edge_lbd::controller::bootstrap::{Bootstrapper, SshBootstrapper, SshKey, Target};
 use edge_lbd::controller::model::{EdgeStatus, ProviderSpec};
 use edge_lbd::controller::{Controller, NewEdge, Options};
@@ -64,7 +65,7 @@ async fn bootstraps_a_machine_over_ssh_and_manages_it() {
     let mgmt = free_port().await;
 
     let mut o = Options::new(dir.join("ctl"));
-    o.edge_binary = PathBuf::from(env!("CARGO_BIN_EXE_edge-lbd"));
+    o.agents = Agents::single(std::env::consts::ARCH, env!("CARGO_BIN_EXE_edge-lbd"));
     o.bootstrapper = Some(Arc::new(bootstrapper(&dir, &fake, Some(stage.clone()))));
     o.tick = Duration::from_millis(50);
     o.poll_every = Duration::from_millis(150);
@@ -158,7 +159,7 @@ async fn ssh_failures_surface_clearly_and_nothing_is_run_on_bad_input() {
     // A malicious host that answers `mktemp` with a crafted path is refused before any root script is built.
     let evil = dir.join("evil-ssh");
     write_exec(&evil, "#!/bin/sh\necho '/tmp/edge-lb.x; rm -rf /'\n");
-    let ctx = edge_lbd::controller::bootstrap::InstallCtx { ca_pem: "x".into(), binary: PathBuf::from(env!("CARGO_BIN_EXE_edge-lbd")) };
+    let ctx = edge_lbd::controller::bootstrap::InstallCtx { ca_pem: "x".into(), agents: Agents::single(std::env::consts::ARCH, env!("CARGO_BIN_EXE_edge-lbd")) };
     let err = bootstrapper(&dir, &evil, None).install(&t("root"), &ctx).await.unwrap_err().to_string();
     assert!(err.contains("unexpected temp directory"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);

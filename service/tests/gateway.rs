@@ -45,8 +45,9 @@ async fn controller(tag: &str) -> (Arc<Controller>, PathBuf) {
     let dir = tmp(tag);
     let mut o = Options::new(dir.join("ctl"));
     o.tick = Duration::from_secs(3600);
-    o.edge_binary = dir.join("fake-binary");
-    std::fs::write(&o.edge_binary, b"#!fake-binary").unwrap();
+    let fake = dir.join("fake-binary");
+    std::fs::write(&fake, b"#!fake-binary").unwrap();
+    o.agents = edge_lbd::controller::agents::Agents::single("x86_64", fake);
     o.gateway = Some(GatewayListen { listen: "127.0.0.1:0".parse().unwrap(), host: "127.0.0.1".into() });
     let ctl = Controller::start(o).await.unwrap();
     // The reconcile loop's first tick is immediate; let it pass while there are no edges, so it
@@ -182,8 +183,12 @@ async fn enrolment_tokens_are_single_use_expire_and_reveal_nothing() {
     let script = script.text().await.unwrap();
     assert!(script.contains(&format!("--pin {fp}")) && script.contains(&token) && !script.contains('@'));
     assert!(!std::fs::read_to_string(_d.join("ctl/controller.json")).unwrap().contains(&token), "token stored in clear");
-    let bin = http.get(format!("https://{host}/gw/binary/{token}")).send().await.unwrap();
+    let bin = http.get(format!("https://{host}/gw/binary/{token}/x86_64")).send().await.unwrap();
     assert_eq!(bin.bytes().await.unwrap().as_ref(), b"#!fake-binary");
+    // Only architectures the controller really has; the name is looked up, never used as a path.
+    for arch in ["aarch64", "riscv64", "..%2F..%2Fetc%2Fpasswd"] {
+        assert_eq!(http.get(format!("https://{host}/gw/binary/{token}/{arch}")).send().await.unwrap().status(), 422, "{arch}");
+    }
 
     let enrol = |tok: String, key: &'static str| {
         let (http, host) = (http.clone(), host.clone());
@@ -209,7 +214,7 @@ async fn enrolment_tokens_are_single_use_expire_and_reveal_nothing() {
     // Single use: replay, and the installer for a spent token, are both refused.
     assert_eq!(enrol(token.clone(), K_GW).await.status(), 401);
     assert_eq!(http.get(format!("https://{host}/gw/install/{token}")).send().await.unwrap().status(), 401);
-    assert_eq!(http.get(format!("https://{host}/gw/binary/{token}")).send().await.unwrap().status(), 401);
+    assert_eq!(http.get(format!("https://{host}/gw/binary/{token}/x86_64")).send().await.unwrap().status(), 401);
 
     // Expiry.
     let t2 = token_of(&ctl.start_enrolment("t", "home").unwrap().command);

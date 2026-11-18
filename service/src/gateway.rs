@@ -16,7 +16,6 @@ use crate::{pki, tls};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -147,7 +146,7 @@ struct Identity {
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut f = crate::fsutil::private_options().write(true).create(true).truncate(true).open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)?;

@@ -4,6 +4,7 @@
 //! The data plane never depends on the controller being up: edges keep serving from their
 //! last applied config.
 
+pub mod agents;
 pub mod api;
 pub mod audit;
 pub mod auth;
@@ -34,9 +35,9 @@ pub const DEFAULT_MGMT_PORT: u16 = 7443;
 
 pub struct Options {
     pub data_dir: PathBuf,
-    /// The edge binary pushed to new machines. Must match their OS and CPU (static musl builds
-    /// run anywhere; a glibc build only runs on equal-or-newer glibc).
-    pub edge_binary: PathBuf,
+    /// The edge/gateway binaries pushed to new machines, by CPU. They must be Linux builds (static
+    /// musl builds run anywhere; a glibc build only runs on equal-or-newer glibc).
+    pub agents: agents::Agents,
     /// Override how machines are bootstrapped (tests). Default: the system `ssh`.
     pub bootstrapper: Option<Arc<dyn Bootstrapper>>,
     pub hetzner_base: String,
@@ -58,7 +59,7 @@ impl Options {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
-            edge_binary: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("edge-lbd")),
+            agents: agents::Agents::for_this_controller(),
             bootstrapper: None,
             hetzner_base: std::env::var("EDGE_LB_HETZNER_URL").unwrap_or_else(|_| "https://api.hetzner.cloud/v1".into()),
             cloudflare_base: std::env::var("EDGE_LB_CLOUDFLARE_URL").unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".into()),
@@ -342,25 +343,20 @@ impl Controller {
     }
 
     /// Locations and server types for the "add edge" form. `compatible` marks types whose CPU
-    /// architecture matches the edge binary this controller can install.
+    /// architecture this controller has an edge binary for.
     pub async fn catalog(&self) -> Result<serde_json::Value, CtlError> {
         let (h, _) = self.hetzner().map_err(|e| CtlError::Invalid(vec![e.to_string()]))?;
         let cat = h.catalog().await.map_err(|e| CtlError::Internal(format!("{e:#}")))?;
-        let mine = match std::env::consts::ARCH {
-            "x86_64" => "x86",
-            "aarch64" => "arm",
-            other => other,
-        };
         let types: Vec<serde_json::Value> = cat
             .server_types
             .iter()
             .map(|t| {
                 let mut v = serde_json::to_value(t).unwrap_or_default();
-                v["compatible"] = serde_json::json!(t.architecture == mine);
+                v["compatible"] = serde_json::json!(self.opts.agents.get(&t.architecture).is_some());
                 v
             })
             .collect();
-        Ok(serde_json::json!({ "locations": cat.locations, "server_types": types, "edge_binary_arch": mine }))
+        Ok(serde_json::json!({ "locations": cat.locations, "server_types": types, "agent_archs": self.opts.agents.archs() }))
     }
 
     pub fn dns_status(&self) -> DnsStatus {

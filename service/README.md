@@ -38,6 +38,30 @@ The controller needs `ssh` and `ssh-keygen` (openssh-client). Machines need syst
 passwordless `sudo`, and TCP **7443** (management) plus your route ports reachable. To adopt an existing
 machine, add the public key shown in *Settings* to its `authorized_keys`.
 
+## Running the controller on Windows
+
+The controller (and only the controller) builds and runs on Windows. Edges and gateways are Linux machines
+the controller installs for you, so the Windows build carries static Linux builds to push:
+
+```
+edge-lbd.exe
+agents\edge-lbd-x86_64      static Linux builds (musl), one per CPU you want to install on
+agents\edge-lbd-aarch64
+```
+
+`edge-lbd.exe controller` finds `agents` beside itself (or pass `--agents-dir`). The controller reads each
+machine's CPU over SSH and uploads the matching build; a gateway's install command does the same with
+`uname -m`. A Linux controller still defaults to pushing a copy of itself (any other CPU needs `agents`).
+
+- **Needs** the Windows OpenSSH client (`ssh`, `ssh-keygen`; included in Windows 10/11, *Optional features*).
+- **Data** lives in `%APPDATA%\edge-lb`, restricted to your account. `controller.json` (CA key, provider
+  tokens) is encrypted with your Windows login (DPAPI), so a copy is useless on another account or machine.
+  The controller's SSH private key is a normal file protected by the folder's permissions.
+- **Gateways on your LAN** must reach the controller: pass `--gateway-listen 0.0.0.0:7444 --gateway-host <this PC's LAN IP>`
+  and allow the Windows Firewall prompt.
+- **Not tested on real Windows yet.** The code is type-checked for `x86_64-pc-windows-gnu` and the Linux suite
+  passes, but nothing has been run on Windows: the SSH quoting, DPAPI and ACL calls in particular.
+
 ## Reaching a private network (managed WireGuard)
 
 Edges are public machines; your services often are not (a home server behind CGNAT, a LAN with no open
@@ -225,6 +249,6 @@ that follow the documented API), other distros (Ubuntu, Fedora, RHEL/SELinux), I
   `AllowedIPs`. IPv6 sites.
 - Upgrading edges installed before WireGuard support in place (today: create them anew).
 - Host firewall management on edges (use the provider firewall or `ufw`); a Hetzner Cloud Firewall option.
-- TOTP/2FA; controller high availability (edges keep serving without it); encrypting `controller.json`.
+- TOTP/2FA; controller high availability (edges keep serving without it); encrypting `controller.json` on Linux (on Windows it is already encrypted with DPAPI).
 - A container image, rolling edge upgrades, more providers (DigitalOcean, Vultr, …), UDP routes, per-region target overrides,
   weighted / least-connections balancing.

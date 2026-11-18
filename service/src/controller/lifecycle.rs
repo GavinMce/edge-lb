@@ -256,7 +256,7 @@ impl Controller {
             Err(err) => return self.fail(&e.id, &format!("{err:#}")),
         };
         let ca_pem = self.store.read(|s| s.ca.cert.clone());
-        let ctx = InstallCtx { ca_pem, binary: self.opts.edge_binary.clone() };
+        let ctx = InstallCtx { ca_pem, agents: self.opts.agents.clone() };
         match bs.install(&t, &ctx).await {
             Ok(done) => match pki::fingerprint_pem(&done.cert_pem) {
                 Ok(fp) => {

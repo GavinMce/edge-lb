@@ -12,7 +12,6 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -79,7 +78,7 @@ struct StatusResp {
 
 fn write_secret(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    let mut f = crate::fsutil::private_options().write(true).create(true).truncate(true).open(path)?;
     f.write_all(contents.as_bytes())?;
     Ok(())
 }

@@ -25,8 +25,8 @@ pub struct Target {
 
 pub struct InstallCtx {
     pub ca_pem: String,
-    /// The edge binary to install (must match the target's OS and CPU).
-    pub binary: PathBuf,
+    /// The Linux binaries available to install; the one matching the machine's CPU is used.
+    pub agents: super::agents::Agents,
 }
 
 #[derive(Debug, Clone)]
@@ -64,9 +64,9 @@ impl SshKey {
         let private = ssh_dir.join("id_ed25519");
         let pub_path = ssh_dir.join("id_ed25519.pub");
         if !private.exists() {
-            let out = Command::new(keygen)
-                .args(["-q", "-t", "ed25519", "-N", "", "-C", "edge-lb-controller", "-f"])
-                .arg(&private)
+            let mut cmd = Command::new(keygen);
+            cmd.args(["-q", "-t", "ed25519", "-N", "", "-C", "edge-lb-controller", "-f"]).arg(&private);
+            let out = quiet(&mut cmd)
                 .output()
                 .await
                 .with_context(|| format!("running {keygen} (is openssh-client installed?)"))?;
@@ -76,6 +76,29 @@ impl SshKey {
         }
         let public = std::fs::read_to_string(&pub_path).with_context(|| format!("reading {}", pub_path.display()))?.trim().to_string();
         Ok(SshKey { private, public })
+    }
+}
+
+/// Don't flash a console window for every `ssh` when the controller runs as a Windows GUI app.
+fn quiet(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// `-o UserKnownHostsFile=...`. OpenSSH splits option values on spaces, and Windows profile paths
+/// often have one, so there the path is quoted and uses forward slashes.
+fn known_hosts_option(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("UserKnownHostsFile=\"{}\"", path.display().to_string().replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("UserKnownHostsFile={}", path.display())
     }
 }
 
@@ -351,7 +374,7 @@ impl SshBootstrapper {
         cmd.arg("-i").arg(&self.key.private)
             .args(["-p", &t.ssh_port.to_string()])
             .args(["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR"])
-            .arg("-o").arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
+            .arg("-o").arg(known_hosts_option(&self.known_hosts))
             .args(["-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"])
             .arg(format!("{}@{}", t.ssh_user, t.ip))
             .arg(remote)
@@ -363,7 +386,7 @@ impl SshBootstrapper {
             Input::File(p) => cmd.stdin(Stdio::from(std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?)),
             Input::Bytes(_) => cmd.stdin(Stdio::piped()),
         };
-        let mut child = cmd.spawn().with_context(|| format!("running {} (is openssh-client installed?)", self.ssh_bin))?;
+        let mut child = quiet(&mut cmd).spawn().with_context(|| format!("running {} (is the OpenSSH client installed?)", self.ssh_bin))?;
         if let Input::Bytes(b) = input {
             let mut stdin = child.stdin.take().unwrap();
             stdin.write_all(&b).await.ok();
@@ -397,7 +420,17 @@ impl Bootstrapper for SshBootstrapper {
         if !valid_remote_dir(&dir) {
             bail!("remote host returned an unexpected temp directory: {dir:?}");
         }
-        self.ssh(t, &format!("cat > {dir}/edge-lbd"), Input::File(ctx.binary.clone()), Duration::from_secs(300)).await.context("uploading the edge binary")?;
+        // What the machine reports is only ever compared against our own table, never interpolated.
+        let raw_arch = self.ssh(t, "uname -m", Input::None, Duration::from_secs(20)).await?;
+        let binary = ctx.agents.get(raw_arch.trim()).ok_or_else(|| {
+            let have = ctx.agents.archs().join(", ");
+            let have = if have.is_empty() { "none".to_string() } else { have };
+            anyhow!(
+                "this machine's CPU ({}) has no matching edge binary; this controller can install: {have}",
+                raw_arch.trim().chars().take(20).filter(|c| c.is_ascii_graphic()).collect::<String>()
+            )
+        })?;
+        self.ssh(t, &format!("cat > {dir}/edge-lbd"), Input::File(binary.to_path_buf()), Duration::from_secs(300)).await.context("uploading the edge binary")?;
         self.ssh(t, &format!("cat > {dir}/ca.pem"), Input::Bytes(ctx.ca_pem.clone().into_bytes()), Duration::from_secs(30)).await?;
         let script = install_script(&dir, t.mgmt_port, self.stage.as_deref())?;
         let out = self.ssh(t, &format!("{}sh -s", Self::sudo(t)), Input::Bytes(script.into_bytes()), Duration::from_secs(180)).await.context("running the installer")?;
@@ -411,7 +444,9 @@ impl Bootstrapper for SshBootstrapper {
 
     async fn forget(&self, t: &Target) {
         for host in [t.ip.to_string(), format!("[{}]:{}", t.ip, t.ssh_port)] {
-            let _ = Command::new(&self.keygen_bin).arg("-R").arg(host).arg("-f").arg(&self.known_hosts).stdout(Stdio::null()).stderr(Stdio::null()).status().await;
+            let mut cmd = Command::new(&self.keygen_bin);
+            cmd.arg("-R").arg(host).arg("-f").arg(&self.known_hosts).stdout(Stdio::null()).stderr(Stdio::null());
+            let _ = quiet(&mut cmd).status().await;
         }
     }
 }

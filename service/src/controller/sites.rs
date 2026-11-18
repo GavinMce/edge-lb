@@ -415,13 +415,23 @@ impl Controller {
             .read(|s| s.gateway_tls.as_ref().map(|p| (pki::spki_pin(&p.key), pki::fingerprint_pem(&p.cert))))
             .ok_or_else(|| GwError::Internal("no gateway certificate".into()))?;
         let (pin, fp) = (pin.map_err(|e| GwError::Internal(e.to_string()))?, fp.map_err(|e| GwError::Internal(e.to_string()))?);
-        let bin = std::fs::read(&self.opts.edge_binary).map_err(|e| GwError::Internal(format!("reading the binary to serve: {e}")))?;
-        render_install_script(&ep.hostport, token, &pin, &fp, &sha256_hex(&bin), std::env::consts::ARCH).map_err(|e| GwError::Internal(e.to_string()))
+        let mut bins = Vec::new();
+        for arch in self.opts.agents.archs() {
+            let path = self.opts.agents.get(arch).expect("listed architecture");
+            let bin = std::fs::read(path).map_err(|e| GwError::Internal(format!("reading the {arch} binary to serve: {e}")))?;
+            bins.push((arch, sha256_hex(&bin)));
+        }
+        if bins.is_empty() {
+            return Err(GwError::Internal("this controller has no Linux gateway binary to serve (see the agents directory)".into()));
+        }
+        render_install_script(&ep.hostport, token, &pin, &fp, &bins).map_err(|e| GwError::Internal(e.to_string()))
     }
 
-    pub async fn gw_binary(&self, token: &str) -> Result<Vec<u8>, GwError> {
+    /// The gateway binary for a CPU architecture. `arch` is only ever looked up, never used as a path.
+    pub async fn gw_binary(&self, token: &str, arch: &str) -> Result<Vec<u8>, GwError> {
         self.site_for_token(token).ok_or(GwError::Unauthorized)?;
-        tokio::fs::read(&self.opts.edge_binary).await.map_err(|e| GwError::Internal(format!("reading the binary to serve: {e}")))
+        let path = self.opts.agents.get(arch).ok_or_else(|| GwError::Invalid("no binary for that architecture".into()))?;
+        tokio::fs::read(path).await.map_err(|e| GwError::Internal(format!("reading the binary to serve: {e}")))
     }
 
     pub(crate) async fn start_gateway_listener(self: &Arc<Self>, g: &GatewayListen) -> anyhow::Result<()> {
@@ -476,7 +486,7 @@ type Ctl = Ax<Arc<Controller>>;
 pub fn gateway_router(ctl: Arc<Controller>) -> Router {
     Router::new()
         .route("/gw/install/:token", get(h_script))
-        .route("/gw/binary/:token", get(h_binary))
+        .route("/gw/binary/:token/:arch", get(h_binary))
         .route("/gw/v1/enroll", post(h_enroll))
         .route("/gw/v1/sync", post(h_sync))
         .layer(DefaultBodyLimit::max(256 * 1024))
@@ -488,8 +498,8 @@ async fn h_script(Ax(c): Ctl, Path(token): Path<String>) -> Result<Response, GwE
     Ok(([(header::CONTENT_TYPE, "text/x-shellscript"), (header::CACHE_CONTROL, "no-store")], s).into_response())
 }
 
-async fn h_binary(Ax(c): Ctl, Path(token): Path<String>) -> Result<Response, GwError> {
-    let b = c.gw_binary(&token).await?;
+async fn h_binary(Ax(c): Ctl, Path((token, arch)): Path<(String, String)>) -> Result<Response, GwError> {
+    let b = c.gw_binary(&token, &arch).await?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, "no-store")], b).into_response())
 }
 
@@ -510,12 +520,14 @@ set -eu
 HOST='@HOST@'
 TOKEN='@TOKEN@'
 PIN='@PIN@'
-BINSHA='@BINSHA@'
 DIR=/var/lib/edge-lb-gateway
 log() { printf 'edge-lb: %s\n' "$*" >&2; }
 [ "$(id -u)" -eq 0 ] || { log "run as root:  curl ... | sudo sh"; exit 1; }
 for c in systemctl curl sha256sum; do command -v "$c" >/dev/null 2>&1 || { log "$c is required"; exit 1; }; done
-[ "$(uname -m)" = '@ARCH@' ] || { log "this controller serves a @ARCH@ binary but this machine is $(uname -m)"; exit 1; }
+case "$(uname -m)" in
+@BINARIES@
+  *) log "this controller has no gateway binary for $(uname -m)"; exit 1 ;;
+esac
 
 if ! command -v wg >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
   log "installing wireguard-tools, nftables and iproute2"
@@ -538,7 +550,7 @@ ip link del edgelb-probe >/dev/null 2>&1 || true
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 log "downloading the gateway binary (certificate pinned)"
-curl -fsS -k --pinnedpubkey "$PIN" -o "$tmp/edge-lbd" "https://$HOST/gw/binary/$TOKEN"
+curl -fsS -k --pinnedpubkey "$PIN" -o "$tmp/edge-lbd" "https://$HOST/gw/binary/$TOKEN/$ARCH"
 echo "$BINSHA  $tmp/edge-lbd" | sha256sum -c - >/dev/null 2>&1 || { log "the downloaded binary does not match what the controller advertised"; exit 1; }
 install -d -m 0755 /usr/local/bin
 install -m 0755 "$tmp/edge-lbd" /usr/local/bin/edge-lbd.new
@@ -591,16 +603,29 @@ else
 fi
 "#;
 
-pub fn render_install_script(hostport: &str, token: &str, pin: &str, fp: &str, binsha: &str, arch: &str) -> anyhow::Result<String> {
+/// `bins` is one `(architecture, sha256 of that binary)` per CPU the controller can serve.
+pub fn render_install_script(hostport: &str, token: &str, pin: &str, fp: &str, bins: &[(&str, String)]) -> anyhow::Result<String> {
     let hexn = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
     anyhow::ensure!(valid_hostport(hostport), "unsafe controller address");
-    anyhow::ensure!(hexn(token, 64) && hexn(fp, 64) && hexn(binsha, 64), "unsafe token or fingerprint");
+    anyhow::ensure!(hexn(token, 64) && hexn(fp, 64), "unsafe token or fingerprint");
+    anyhow::ensure!(!bins.is_empty(), "no binaries to serve");
     anyhow::ensure!(
         pin.strip_prefix("sha256//").is_some_and(|b| b.len() == 44 && b.bytes().all(|c| c.is_ascii_alphanumeric() || b"+/=".contains(&c))),
         "unsafe pin"
     );
-    anyhow::ensure!(!arch.is_empty() && arch.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'), "unsafe architecture");
-    Ok(INSTALL_SH.replace("@HOST@", hostport).replace("@TOKEN@", token).replace("@PIN@", pin).replace("@BINSHA@", binsha).replace("@FP@", fp).replace("@ARCH@", arch))
+    // One `case` branch per architecture. Only canonical names and hex digests can get in here.
+    let mut arms = Vec::new();
+    for (arch, sha) in bins {
+        anyhow::ensure!(super::agents::normalize_arch(arch) == Some(*arch) && hexn(sha, 64), "unsafe binary entry");
+        let uname = if *arch == super::agents::AARCH64 { "aarch64|arm64" } else { "x86_64|amd64" };
+        arms.push(format!("  {uname}) ARCH={arch}; BINSHA={sha} ;;"));
+    }
+    Ok(INSTALL_SH
+        .replace("@BINARIES@", &arms.join("\n"))
+        .replace("@HOST@", hostport)
+        .replace("@TOKEN@", token)
+        .replace("@PIN@", pin)
+        .replace("@FP@", fp))
 }
 
 #[cfg(test)]
@@ -624,8 +649,7 @@ mod tests {
             &"ab".repeat(32),
             &pki::spki_pin(&c.key).unwrap(),
             &pki::fingerprint_pem(&c.cert).unwrap(),
-            &"cd".repeat(32),
-            "x86_64",
+            &[("x86_64", "cd".repeat(32)), ("aarch64", "ef".repeat(32))],
         )
         .unwrap()
     }
@@ -634,7 +658,15 @@ mod tests {
     async fn install_script_is_valid_sh_with_everything_filled_in() {
         let s = script();
         assert!(!s.contains('@'), "unreplaced placeholder");
-        for must in ["--pinnedpubkey \"$PIN\"", "sha256sum -c", "CapabilityBoundingSet=CAP_NET_ADMIN", "--controller ctl.example.com:7444"] {
+        for must in [
+            "--pinnedpubkey \"$PIN\"",
+            "sha256sum -c",
+            "CapabilityBoundingSet=CAP_NET_ADMIN",
+            "--controller ctl.example.com:7444",
+            "x86_64|amd64) ARCH=x86_64;",
+            "aarch64|arm64) ARCH=aarch64;",
+            "/gw/binary/$TOKEN/$ARCH",
+        ] {
             assert!(s.contains(must), "{must}");
         }
         let dir = std::env::temp_dir().join(format!("gwscript-{}", std::process::id()));
@@ -651,11 +683,14 @@ mod tests {
         let c = pki::self_signed_controller().unwrap();
         let (pin, fp) = (pki::spki_pin(&c.key).unwrap(), pki::fingerprint_pem(&c.cert).unwrap());
         let (tok, sha) = ("ab".repeat(32), "cd".repeat(32));
-        assert!(render_install_script("h:1", &tok, &pin, &fp, &sha, "x86_64").is_ok());
-        assert!(render_install_script("h:1'; rm -rf /; '", &tok, &pin, &fp, &sha, "x86_64").is_err());
-        assert!(render_install_script("h:1", &format!("{}'", &tok[..63]), &pin, &fp, &sha, "x86_64").is_err());
-        assert!(render_install_script("h:1", &tok, "sha256//x'y", &fp, &sha, "x86_64").is_err());
-        assert!(render_install_script("h:1", &tok, &pin, &fp, &sha, "x86; id").is_err());
+        let ok = [("x86_64", sha.clone())];
+        assert!(render_install_script("h:1", &tok, &pin, &fp, &ok).is_ok());
+        assert!(render_install_script("h:1'; rm -rf /; '", &tok, &pin, &fp, &ok).is_err());
+        assert!(render_install_script("h:1", &format!("{}'", &tok[..63]), &pin, &fp, &ok).is_err());
+        assert!(render_install_script("h:1", &tok, "sha256//x'y", &fp, &ok).is_err());
+        assert!(render_install_script("h:1", &tok, &pin, &fp, &[("x86; id", sha.clone())]).is_err());
+        assert!(render_install_script("h:1", &tok, &pin, &fp, &[("x86_64", format!("{}'", &sha[..63]))]).is_err());
+        assert!(render_install_script("h:1", &tok, &pin, &fp, &[]).is_err());
     }
 
     fn state() -> State {

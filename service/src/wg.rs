@@ -375,7 +375,6 @@ async fn iface_exists() -> bool {
 /// Read the private key at `path`, creating it (mode 0600, via `wg genkey`) if it doesn't exist.
 /// Returns the public key.
 pub async fn ensure_key(path: &Path) -> Result<String> {
-    use std::os::unix::fs::OpenOptionsExt;
     if !path.exists() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -385,7 +384,7 @@ pub async fn ensure_key(path: &Path) -> Result<String> {
         if !is_key(key) {
             bail!("`wg genkey` returned something that isn't a key");
         }
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).with_context(|| format!("creating {}", path.display()))?;
+        let mut f = crate::fsutil::private_options().write(true).create_new(true).open(path).with_context(|| format!("creating {}", path.display()))?;
         std::io::Write::write_all(&mut f, format!("{key}\n").as_bytes())?;
     }
     public_key(path).await
