@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "edge-lb",
+  "identifier": "app.edge-lb.controller",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi"],
+    "shortDescription": "edge-lb controller",
+    "longDescription": "Manage edge load balancers, DNS and WireGuard tunnels to private networks from your PC. The controller never carries traffic; your edges keep serving if it is closed.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "agents/*": "agents/"
+    }
+  }
+}

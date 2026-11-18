@@ -336,13 +336,9 @@ async fn controller(args: ControllerArgs) -> Result<()> {
     if let Some(code) = ctl.setup_code.lock().unwrap().clone() {
         info!("FIRST RUN: open the UI and create the admin account with setup code {code}");
     }
-    let app = edge_lbd::controller::api::router(ctl.clone(), args.secure_cookies);
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("binding {}", args.listen))?;
     info!("controller UI on http://{}", args.listen);
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    ctl.stop();
+    edge_lbd::controller::api::serve(ctl, listener, args.secure_cookies, shutdown_signal()).await?;
     Ok(())
 }
 

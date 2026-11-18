@@ -50,3 +50,9 @@ panic = "abort"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+# The Windows desktop app lives in its own crate so Linux builds (and CI) never compile Tauri.
+# It shares Cargo.lock with the service, so both build exactly the same controller dependencies.
+[workspace]
+members = ["desktop/src-tauri"]
+default-members = ["."]

@@ -673,8 +673,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("install.sh");
         std::fs::write(&p, &s).unwrap();
-        let out = tokio::process::Command::new("sh").arg("-n").arg(&p).output().await.unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        match tokio::process::Command::new("sh").arg("-n").arg(&p).output().await {
+            Ok(out) => assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr)),
+            // The script only ever runs on Linux; on Windows `sh` exists only with Git for Windows on PATH.
+            Err(e) if cfg!(windows) => eprintln!("skipping the shell syntax check: no `sh` on PATH ({e})"),
+            Err(e) => panic!("running sh: {e}"),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

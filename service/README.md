@@ -38,6 +38,38 @@ The controller needs `ssh` and `ssh-keygen` (openssh-client). Machines need syst
 passwordless `sudo`, and TCP **7443** (management) plus your route ports reachable. To adopt an existing
 machine, add the public key shown in *Settings* to its `authorized_keys`.
 
+## Running the controller on a server
+
+On a Linux server with systemd (Debian, Ubuntu, Fedora…), one command installs the controller from a release,
+checks its checksum, runs it as its own unprivileged user (`edge-lb`) in a sandboxed service, and prints the
+one-time setup code:
+
+```sh
+curl -fsSL https://github.com/<owner>/<repo>/releases/latest/download/install-controller.sh | sudo sh -s -- [options]
+```
+
+The desktop app's launcher has **Set up a controller on a server**, which fills in the options for you and
+writes the exact commands (including how to reach the controller afterwards). Options:
+
+| Option | Meaning |
+|---|---|
+| *(none)* | UI on `127.0.0.1:8080` of the server. Reach it from your PC through an SSH tunnel: `ssh -N -L 8081:127.0.0.1:8080 user@server`, then connect to `http://127.0.0.1:8081`. Nothing is exposed. |
+| `--listen 192.168.1.20:8080` | UI on a private address (LAN, Tailscale). The controller refuses public addresses. The page is plain `http`. |
+| `--tls-proxy` | You run a TLS reverse proxy on the server in front of `127.0.0.1:8080` (the installer prints a Caddy example); cookies are marked `Secure`. |
+| `--gateway-listen 0.0.0.0:7444 --gateway-host <name-or-ip>` | Accept WireGuard gateways. Open inbound TCP 7444. |
+| `--this-arch-only` | Don't also fetch the other CPU's build. By default both are installed so the controller can set up x86_64 and aarch64 edges. |
+| `--version TAG`, `--release-base URL`, `--from DIR` | Pin a release, use a mirror, or install local builds. |
+| `--uninstall` / `--purge` | Remove it (your data stays unless `--purge`). |
+
+Layout: program `/usr/local/bin/edge-lb-controller`, Linux builds for edges in `/usr/local/lib/edge-lb/agents`,
+data in `/var/lib/edge-lb-controller` (mode 0700), unit `edge-lb-controller.service`. Run the command again to
+upgrade or change options. The checksum comes from the same release as the download, so it catches corruption
+but trusts GitHub and your TLS connection; for anything stricter, build from source and use `--from`.
+
+`deploy/install-controller.sh` is tested by `tests/controller_installer.rs` (the real script in its `--stage`
+mode, with a fake release on `file://`), plus a check that OpenSSH works inside the unit's sandbox. Starting
+the service as root under real systemd is not covered by an automated test.
+
 ## Running the controller on Windows
 
 The controller (and only the controller) builds and runs on Windows. Edges and gateways are Linux machines
@@ -56,11 +88,57 @@ machine's CPU over SSH and uploads the matching build; a gateway's install comma
 - **Needs** the Windows OpenSSH client (`ssh`, `ssh-keygen`; included in Windows 10/11, *Optional features*).
 - **Data** lives in `%APPDATA%\edge-lb`, restricted to your account. `controller.json` (CA key, provider
   tokens) is encrypted with your Windows login (DPAPI), so a copy is useless on another account or machine.
-  The controller's SSH private key is a normal file protected by the folder's permissions.
+  The controller's SSH private key is a normal file in `ssh\`; Windows `ssh-keygen` gives it the ACL OpenSSH
+  requires (your account, Administrators and SYSTEM).
 - **Gateways on your LAN** must reach the controller: pass `--gateway-listen 0.0.0.0:7444 --gateway-host <this PC's LAN IP>`
   and allow the Windows Firewall prompt.
-- **Not tested on real Windows yet.** The code is type-checked for `x86_64-pc-windows-gnu` and the Linux suite
-  passes, but nothing has been run on Windows: the SSH quoting, DPAPI and ACL calls in particular.
+- **Tested on Windows 11:** the build, the full test suite, DPAPI, the data-folder ACL, SSH key creation and the
+  `ssh` option quoting. **Not yet tested:** adopting or creating a real machine end to end from Windows.
+
+### Desktop app (MSI)
+
+`desktop\` wraps the controller in a [Tauri](https://tauri.app) app (WebView2). It opens a small **launcher**
+with two choices:
+
+- **This PC** runs the controller inside the app (the same code as `edge-lbd controller`), serving the normal
+  UI on `127.0.0.1:17480` (any free port if that is taken). On the very first run the setup code is filled into
+  the form for you (the server still requires it).
+- **Another machine** connects to a controller running elsewhere. Saved controllers are listed; a form adds a
+  new one. An address is checked (`GET /api/session` must answer like an edge-lb controller) before it is
+  saved or shown. `https://` is required, except for private-network addresses (LAN, Tailscale, `127.0.0.1`
+  through an SSH tunnel), because the sign-in cookie must not travel unencrypted.
+
+The controller's page then opens in its own window. That window can only show the controller it was opened
+for, and it has no access to the app: only the launcher page may call into it. Closing a window hides it to the
+tray. The tray menu has **Switch controller…** (back to the launcher) and **Quit**, which stops the local
+controller; a local controller keeps running while you look at a remote one. A second launch brings the
+existing window forward. Logs go to `%APPDATA%\edge-lb\edge-lb.log`.
+
+Two small files live in `%APPDATA%\edge-lb`:
+
+```toml
+# app.toml — edit by hand; the app never writes it. Every key is optional.
+startup = "ask"            # "ask" shows the launcher; "local"; or the name of a saved remote
+[local]
+port = 17480
+data_dir = ""              # default: this folder
+gateway_listen = "0.0.0.0:7444"     # for WireGuard gateways on your LAN: set both, or neither,
+gateway_host   = "192.168.1.20"     # and allow the Windows Firewall prompt
+```
+
+`remotes.toml` is the saved list; the app maintains it (and you may edit it). A mistake in `app.toml` never
+stops the app: it falls back to the defaults and says what is wrong, with the line, in the launcher.
+
+```
+cd service\desktop
+mkdir src-tauri\agents        # then copy edge-lbd-x86_64 / edge-lbd-aarch64 (static Linux builds) into it
+npm ci
+npx tauri build               # MSI: target\release\bundle\msi\
+npx tauri dev                 # run it without bundling
+```
+
+The release workflow builds the MSI (`edge-lb-<tag>-windows-x64.msi`) from the musl builds it makes first. It is
+unsigned, so Windows SmartScreen will warn on first run.
 
 ## Reaching a private network (managed WireGuard)
 

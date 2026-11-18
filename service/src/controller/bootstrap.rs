@@ -456,9 +456,32 @@ mod tests {
     use super::*;
 
     async fn sh_syntax_ok(script: &str) -> bool {
-        let mut child = Command::new("sh").arg("-n").stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let spawned = Command::new("sh").arg("-n").stdin(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        // The scripts only ever run on Linux; on Windows `sh` exists only if Git for Windows is on PATH.
+        let mut child = match spawned {
+            Err(e) if cfg!(windows) => {
+                eprintln!("skipping the shell syntax check: no `sh` on PATH ({e})");
+                return true;
+            }
+            other => other.unwrap(),
+        };
         child.stdin.take().unwrap().write_all(script.as_bytes()).await.unwrap();
         child.wait_with_output().await.unwrap().status.success()
+    }
+
+    /// The real Windows `ssh` must read the quoted option back as one path, spaces and all. `ssh -G`
+    /// prints the resolved configuration without connecting.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_ssh_reads_a_known_hosts_path_with_spaces_as_one_value() {
+        let path = Path::new(r"C:\Users\Some One\AppData\Roaming\edge-lb\ssh\known_hosts");
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-G").arg("-o").arg(known_hosts_option(path)).arg("root@192.0.2.1").stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = quiet(&mut cmd).output().await.expect("the Windows OpenSSH client (ssh.exe) is required to run this test");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let line = text.lines().find(|l| l.starts_with("userknownhostsfile ")).unwrap_or_else(|| panic!("no userknownhostsfile in:\n{text}"));
+        assert_eq!(line, "userknownhostsfile C:/Users/Some One/AppData/Roaming/edge-lb/ssh/known_hosts");
     }
 
     #[tokio::test]

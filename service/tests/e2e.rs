@@ -297,7 +297,9 @@ async fn bind_failure_is_reported_then_recovers() {
     let e = Engine::start(opts()).await.unwrap();
     let v = e.create(route("svc", p, &[], &[a])).await.unwrap();
     assert_eq!(v.status.state, "error");
-    assert!(v.status.error.unwrap().to_lowercase().contains("in use"));
+    // The OS's own wording: "Address already in use" (Linux) / "Only one usage of each socket address" (Windows).
+    let err = v.status.error.unwrap().to_lowercase();
+    assert!(err.contains("in use") || err.contains("only one usage"), "{err}");
 
     drop(squatter);
     wait_until(|| async { e.get("svc").await.unwrap().status.state == "listening" }).await;

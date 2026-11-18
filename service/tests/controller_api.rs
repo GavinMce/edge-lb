@@ -131,8 +131,16 @@ async fn nothing_works_before_setup_and_setup_needs_the_console_code() {
     assert!(!r.dir.join("setup-code").exists());
     assert_eq!(http(r.addr, "POST", "/api/setup", body(&code, PW)).await.status, 409);
     // The password is stored hashed.
-    let stored = std::fs::read_to_string(r.dir.join("controller.json")).unwrap();
-    assert!(stored.contains("$argon2") && !stored.contains(PW));
+    let raw = std::fs::read(r.dir.join("controller.json")).unwrap();
+    assert!(!raw.windows(PW.len()).any(|w| w == PW.as_bytes()), "password stored in clear");
+    // On Windows the file is DPAPI-encrypted, so read it back through the store (which decrypts it).
+    #[cfg(windows)]
+    assert!(raw.starts_with(b"EDGELB-DPAPI-1\n"), "controller.json should be DPAPI-encrypted");
+    #[cfg(not(windows))]
+    assert!(String::from_utf8(raw).unwrap().contains("$argon2"));
+    let reopened = edge_lbd::controller::store::Store::open(&r.dir).unwrap();
+    let hash = reopened.read(|s| s.admin.as_ref().map(|a| a.password_hash.clone())).unwrap();
+    assert!(hash.starts_with("$argon2") && !hash.contains(PW));
 }
 
 #[tokio::test]
