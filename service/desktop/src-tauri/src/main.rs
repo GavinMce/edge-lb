@@ -320,6 +320,7 @@ async fn start_local_controller(app: &AppHandle, st: &AppState) -> Result<LocalS
         tracing::info!("can install edges and gateways for: {}", opts.agents.archs().join(", "));
     }
     opts.gateway = gateway_setting(st)?;
+    opts.deployment = Some("desktop".into());
 
     let ctl = Controller::start(opts).await?;
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", st.cfg.local.port)).await {

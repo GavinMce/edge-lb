@@ -475,12 +475,13 @@ function renderSites(main) {
   const add = () => openSiteDialog(null);
   const noListener = S.status && !S.status.gateway_listener;
   main.replaceChildren(...[
-    h('div', { class: 'page-head' }, h('h2', null, 'Sites'), h('button', { class: 'primary', type: 'button', onclick: add }, 'Add site')),
-    noListener ? h('p', { class: 'callout' }, 'Gateways can\'t connect yet. Start the controller with ',
-      h('code', null, '--gateway-listen 0.0.0.0:7444 --gateway-host <public hostname or IP>'), ' and make that port reachable from your gateway.') : null,
+    h('div', { class: 'page-head' }, h('h2', null, 'Sites & gateways'), h('button', { class: 'primary', type: 'button', onclick: add }, 'Add site')),
+    noListener ? h('div', { class: 'callout' },
+      h('div', null, h('strong', null, 'Gateways can\'t connect yet. '), 'This controller isn\'t listening for them.'),
+      h('button', { class: 'small', type: 'button', onclick: openListenerHelp }, 'How to turn it on')) : null,
     sites.length
       ? h('div', { class: 'list' }, sites.map(siteCard))
-      : h('div', { class: 'empty' }, 'No sites yet. A site is a network behind a gateway, like your home LAN, that your edges can reach over WireGuard without opening any ports at home.',
+      : h('div', { class: 'empty' }, 'No sites yet. A site is a network behind a gateway, like your home LAN, that your edges can reach over WireGuard without opening any ports at home. Add one and you get a single command to run there; this page shows when it connects.',
         h('div', null, h('button', { class: 'primary', type: 'button', onclick: add }, 'Add your first site'))),
   ].filter(Boolean));
 }
@@ -490,6 +491,7 @@ let editingSite = null;
 function openSiteDialog(site) {
   editingSite = site;
   $('#site-title').textContent = site ? 'Edit site' : 'Add a site';
+  $('#site-save').textContent = site ? 'Save' : 'Save and connect a gateway';
   $('#s-name').value = site ? site.name : '';
   $('#s-cidrs').value = site ? site.lan_cidrs.join('\n') : '';
   showErrors($('#site-errors'), []);
@@ -508,10 +510,17 @@ $('#site-form').addEventListener('submit', async (ev) => {
   if (errs.length) return showErrors($('#site-errors'), errs);
   $('#site-save').disabled = true;
   try {
-    if (editingSite) await api('PUT', '/sites/' + encodeURIComponent(editingSite.id), { name, lan_cidrs });
-    else await api('POST', '/sites', { name, lan_cidrs });
-    $('#site-dialog').close();
-    refresh();
+    if (editingSite) {
+      await api('PUT', '/sites/' + encodeURIComponent(editingSite.id), { name, lan_cidrs });
+      $('#site-dialog').close();
+      refresh();
+    } else {
+      // A new site goes straight on to its gateway: one flow from "add" to "connected".
+      const created = await api('POST', '/sites', { name, lan_cidrs });
+      $('#site-dialog').close();
+      refresh();
+      openEnrol(created);
+    }
   } catch (e) {
     if (e.status !== 401) showErrors($('#site-errors'), e.lines);
   } finally {
@@ -528,26 +537,177 @@ function deleteSite(site) {
   });
 }
 
-async function openEnrol(site) {
-  $('#enrol-title').textContent = `Connect a gateway for ${site.name}`;
+// ---- connecting a gateway ----------------------------------------------------------------
+//
+// One dialog, three things it can show: how to turn the gateway listener on (when the controller
+// isn't listening yet), the one-time command, and a live line that follows the gateway from
+// "waiting" to "connected". It polls on its own because the page's refresh is paused while a
+// dialog is open.
+
+let enrolSite = null;      // the site being connected, or null when only showing how to enable gateways
+let enrolBaseline = null;  // enrolled_at before this command was issued, to tell a *new* gateway from the old one
+let enrolTimer = null;
+let enrolExpires = 0;
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast('Copied'); } catch (_) { toast('Select the text and copy it'); }
+}
+
+function codeBlock(text) {
+  return h('div', { class: 'codebox' },
+    h('pre', { class: 'code' }, text),
+    h('button', { class: 'ghost small', type: 'button', onclick: () => copyText(text) }, 'Copy'));
+}
+
+/** How to make this controller listen for gateways, worded for how it is run. */
+function listenerHelp() {
+  const how = S.status && S.status.deployment;
+  const signedOut = h('p', { class: 'hint' }, 'The controller restarts, so you\'ll be signed in again afterwards. Gateways already running keep their tunnels meanwhile.');
+  if (how === 'desktop') {
+    return [
+      h('p', null, 'Gateways on your network dial in to this controller, and it runs on this PC, so it has to listen on your network (not only on this PC).'),
+      h('ol', null,
+        h('li', null, 'Find this PC\'s address: run ', h('code', null, 'ipconfig'), ' and note the IPv4 address, like 192.168.1.20.'),
+        h('li', null, 'Open (or create) ', h('code', null, '%APPDATA%\\edge-lb\\app.toml'), ' and add the lines below, with your address in place of 192.168.1.20:',
+          codeBlock('[local]\ngateway_listen = "0.0.0.0:7444"\ngateway_host = "192.168.1.20"')),
+        h('li', null, 'Quit edge-lb from the tray icon (right-click, Quit), start it again, and allow the Windows Firewall prompt on private networks.')),
+      h('p', { class: 'hint' }, 'This PC has to be on when a gateway is first connected or changed. Traffic that already flows keeps flowing without it. A controller on an always-on server is better for gateways.'),
+      signedOut,
+    ];
+  }
+  if (how === 'server') {
+    return [
+      h('p', null, 'Gateways dial in to this controller. Run the install command on the server again with the gateway options added (keep any options you used the first time):'),
+      codeBlock('--gateway-listen 0.0.0.0:7444 --gateway-host <this server\'s public name or IP>'),
+      h('p', { class: 'hint' }, 'Then allow inbound TCP 7444 in the server\'s firewall and your provider\'s, so the gateway machine can reach it.'),
+      signedOut,
+    ];
+  }
+  return [
+    h('p', null, 'Gateways dial in to this controller. Start it with:'),
+    codeBlock('--gateway-listen 0.0.0.0:7444 --gateway-host <public hostname or IP>'),
+    h('p', { class: 'hint' }, 'and make that TCP port reachable from your gateway machine.'),
+    signedOut,
+  ];
+}
+
+function enrolReset() {
+  clearInterval(enrolTimer);
+  enrolTimer = null;
+  showErrors($('#enrol-errors'), []);
+  for (const id of ['#enrol-prereq', '#enrol-main', '#enrol-ready', '#enrol-recheck', '#enrol-newcmd', '#enrol-live-sub']) $(id).hidden = true;
   $('#enrol-cmd').textContent = '';
   $('#enrol-note').textContent = '';
-  showErrors($('#enrol-errors'), []);
+}
+
+function showListenerHelp() {
+  $('#enrol-prereq').replaceChildren(...listenerHelp());
+  $('#enrol-prereq').hidden = false;
+  $('#enrol-recheck').hidden = false;
+}
+
+/** Just the "how to turn gateways on" help, from the Sites page. */
+async function openListenerHelp() {
+  enrolSite = null;
+  enrolReset();
+  $('#enrol-title').textContent = 'Turn on gateways';
+  showListenerHelp();
+  openDialog('#enrol-dialog');
+}
+
+async function openEnrol(site) {
+  enrolSite = site;
+  enrolReset();
+  $('#enrol-title').textContent = `Connect a gateway for ${site.name}`;
   openDialog('#enrol-dialog');
   try {
-    const r = await api('POST', `/sites/${encodeURIComponent(site.id)}/enrol`);
+    S.status = await api('GET', '/status');
+  } catch (e) {
+    if (e.status !== 401) showErrors($('#enrol-errors'), e.lines);
+    return;
+  }
+  if (!S.status.gateway_listener) return showListenerHelp();
+  await issueCommand();
+}
+
+async function issueCommand() {
+  showErrors($('#enrol-errors'), []);
+  try {
+    // What the site looked like before, so an old gateway's "connected" isn't mistaken for the new one.
+    const now = (await api('GET', '/sites')).find((x) => x.id === enrolSite.id);
+    enrolBaseline = now ? now.gateway.enrolled_at || null : null;
+    const r = await api('POST', `/sites/${encodeURIComponent(enrolSite.id)}/enrol`);
+    enrolExpires = r.expires;
     $('#enrol-cmd').textContent = r.command;
-    $('#enrol-note').textContent = `One-time command, valid until ${clock(r.expires)}. It pins this controller's certificate, installs the gateway, and enrols it. Running it again later with a new command replaces the gateway.`;
+    $('#enrol-note').textContent = 'One-time command. It pins this controller\'s certificate, installs the gateway, and enrols it. Running a new command later replaces the gateway.';
+    $('#enrol-main').hidden = false;
+    $('#enrol-newcmd').hidden = true;
+    $('#enrol-ready').hidden = true;
+    setLive('warn', `Waiting for the gateway to connect… the command is valid for ${inFuture(enrolExpires)}.`);
+    clearInterval(enrolTimer);
+    enrolTimer = setInterval(pollEnrol, 2000);
   } catch (e) {
     if (e.status !== 401) showErrors($('#enrol-errors'), e.lines);
   }
 }
 
-$('#enrol-close').addEventListener('click', () => { $('#enrol-dialog').close(); refresh(); });
-$('#enrol-copy').addEventListener('click', async () => {
-  const text = $('#enrol-cmd').textContent;
-  if (!text) return;
-  try { await navigator.clipboard.writeText(text); toast('Copied'); } catch (_) { toast('Select the text and copy it'); }
+function setLive(cls, text, sub) {
+  $('#enrol-dot').className = 'dot ' + cls;
+  $('#enrol-live-text').textContent = text;
+  $('#enrol-live-sub').textContent = sub || '';
+  $('#enrol-live-sub').hidden = !sub;
+}
+
+async function pollEnrol() {
+  if (!enrolSite || !$('#enrol-dialog').open) return;
+  let site;
+  try {
+    site = (await api('GET', '/sites')).find((x) => x.id === enrolSite.id);
+  } catch (_) { return; }
+  if (!site) return setLive('bad', 'This site no longer exists.');
+  const g = site.gateway;
+  const isNew = g.enrolled && (g.enrolled_at || null) !== enrolBaseline;
+  if (isNew && g.online) {
+    const up = g.tunnels.filter((t) => t.up).length;
+    setLive('ok', 'Gateway connected.', g.tunnels.length
+      ? `Tunnels to edges: ${up} of ${g.tunnels.length} up${g.error ? '. Gateway reports: ' + g.error : ''}.`
+      : 'No edges have WireGuard yet, so there are no tunnels to show.');
+    $('#enrol-ready').hidden = false;
+    $('#enrol-newcmd').hidden = true;
+  } else if (isNew) {
+    setLive('warn', 'Gateway enrolled. Waiting for its first check-in…', g.error || '');
+  } else if (g.enrol_pending_until) {
+    enrolExpires = g.enrol_pending_until;
+    setLive('warn', `Waiting for the gateway to connect… the command is valid for ${inFuture(enrolExpires)}.`);
+  } else {
+    setLive('bad', 'The command expired before a gateway used it.');
+    $('#enrol-newcmd').hidden = false;
+  }
+}
+
+$('#enrol-close').addEventListener('click', () => $('#enrol-dialog').close());
+$('#enrol-dialog').addEventListener('close', () => { clearInterval(enrolTimer); enrolTimer = null; refresh(); });
+$('#enrol-copy').addEventListener('click', () => { const text = $('#enrol-cmd').textContent; if (text) copyText(text); });
+$('#enrol-newcmd').addEventListener('click', issueCommand);
+$('#enrol-recheck').addEventListener('click', async () => {
+  try {
+    S.status = await api('GET', '/status');
+  } catch (e) {
+    if (e.status !== 401) showErrors($('#enrol-errors'), e.lines);
+    return;
+  }
+  if (!S.status.gateway_listener) return toast('Still not listening for gateways');
+  $('#enrol-prereq').hidden = true;
+  $('#enrol-recheck').hidden = true;
+  if (enrolSite) await issueCommand();
+  else { toast('Gateways are on'); $('#enrol-dialog').close(); }
+});
+$('#enrol-route').addEventListener('click', () => {
+  const id = enrolSite && enrolSite.id;
+  $('#enrol-dialog').close();
+  setTab('routes');
+  openRouteDialog(null);
+  if (id) $('#r-site').value = id;
 });
 
 // ---- routes page -------------------------------------------------------------------------

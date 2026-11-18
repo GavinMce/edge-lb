@@ -212,6 +212,11 @@ impl Controller {
         self.gateway.lock().unwrap().clone()
     }
 
+    /// `desktop`, `server`, or `None` (see [`super::Options::deployment`]).
+    pub fn deployment(&self) -> Option<&str> {
+        self.opts.deployment.as_deref()
+    }
+
     pub fn sites(&self) -> Vec<SiteView> {
         let live = self.gw_live.read().unwrap();
         let t = now();

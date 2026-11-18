@@ -111,3 +111,12 @@ pre.code { background: var(--code); border-radius: 8px; padding: 10px 12px; marg
 .warn-text { color: var(--warn); }
 .buttons.start { justify-content: flex-start; }
 #enrol-cmd { white-space: pre-wrap; word-break: break-all; user-select: all; }
+
+/* Connecting a gateway */
+.callout { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 14px; }
+.live { display: flex; align-items: center; gap: 10px; margin: 12px 0 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.ready { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--ok); border-radius: 8px; }
+.steps-help ol { padding-left: 20px; display: grid; gap: 10px; }
+.codebox { position: relative; margin: 8px 0; }
+.codebox pre.code { margin: 0; padding-right: 64px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.codebox button { position: absolute; top: 6px; right: 6px; }

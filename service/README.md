@@ -155,17 +155,24 @@ connection *outward*:
 
 You manage everything from the controller:
 
-1. **Sites → Add site**: a name and the LAN range(s), e.g. `192.168.1.0/24`.
-2. **Connect gateway**: the UI shows one command. Run it on the gateway machine. It pins the controller's
+1. **Sites & gateways → Add site**: a name and the LAN range(s), e.g. `192.168.1.0/24`. Saving goes straight on
+   to step 2.
+2. **Connect a gateway**: the UI shows one command. Run it on the gateway machine. It pins the controller's
    certificate, downloads the binary (checksum-verified), installs `wireguard-tools`/`nftables` and a hardened
-   systemd unit, generates the gateway's own key, and enrols with a one-time token.
+   systemd unit, generates the gateway's own key, and enrols with a one-time token. The dialog follows the
+   gateway live (waiting, enrolled, connected, with how many tunnels are up) and, once connected, offers
+   **Add a route through this site**. If the controller isn't listening for gateways yet, the same dialog says
+   how to turn that on for how it is run (the desktop app, a server installed with `install-controller.sh`, or a
+   plain command line).
 3. **Routes → Add route**: pick the **site**, and give targets inside its ranges (`192.168.1.50:443`).
 
 The controller allocates every node a tunnel address (default `10.100.0.0/24`, change it in Settings before
 creating sites), exchanges **public** keys, and keeps every edge's and gateway's tunnel config in step as edges
 come and go. **Private keys are generated on the machine that uses them and never travel.**
 
-Start the controller with the gateway listener (off by default, so a plain controller exposes nothing extra):
+Start the controller with the gateway listener (off by default, so a plain controller exposes nothing extra; the
+Sites page tells you when it's missing). The controller learns how it is run from `EDGE_LB_DEPLOYMENT`
+(`desktop` or `server`, set by the desktop app and the installer) and words that help accordingly:
 
 ```sh
 edge-lbd controller --listen 127.0.0.1:8080 \

@@ -53,6 +53,14 @@ pub struct Options {
     pub retry_backoff: (Duration, Duration),
     /// Listener for WireGuard gateways. Off unless set, so the controller exposes nothing extra by default.
     pub gateway: Option<GatewayListen>,
+    /// How this controller is run, so the UI can say how to change its startup options: `desktop`
+    /// (the Windows app), `server` (installed by install-controller.sh). `None` for anything else.
+    pub deployment: Option<String>,
+}
+
+/// Only the deployments the UI has instructions for; anything else is treated as "unknown".
+fn known_deployment(s: &str) -> Option<String> {
+    matches!(s.trim(), "desktop" | "server").then(|| s.trim().to_string())
 }
 
 impl Options {
@@ -69,6 +77,7 @@ impl Options {
             reserved_ports: vec![22],
             retry_backoff: (Duration::from_secs(2), Duration::from_secs(30)),
             gateway: None,
+            deployment: std::env::var("EDGE_LB_DEPLOYMENT").ok().and_then(|v| known_deployment(&v)),
         }
     }
 }
@@ -681,5 +690,19 @@ impl Controller {
         })?;
         self.audit.record(actor, "route.delete", id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    use super::known_deployment;
+
+    #[test]
+    fn only_deployments_the_ui_has_instructions_for_are_accepted() {
+        assert_eq!(known_deployment("desktop").as_deref(), Some("desktop"));
+        assert_eq!(known_deployment(" server\n").as_deref(), Some("server"));
+        for other in ["", "docker", "Desktop", "desktop; x", "<script>", "server server"] {
+            assert_eq!(known_deployment(other), None, "{other:?}");
+        }
     }
 }
