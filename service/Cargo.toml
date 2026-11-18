@@ -1,6 +1,6 @@
 [package]
 name = "edge-lbd"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Configurable L4 edge load balancer: routes (domain, listen ip:port) -> targets, with a web UI"
 
