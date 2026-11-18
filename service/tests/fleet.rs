@@ -179,6 +179,15 @@ fn managed_ips(c: &C, name: &str) -> Vec<String> {
 struct Machines {
     edges: tokio::sync::Mutex<HashMap<String, EdgeHandle>>,
     fail_install: Mutex<Option<String>>,
+    /// Make the next updates fail, as if the new version would not start.
+    fail_update: Mutex<Option<String>>,
+    /// How long an update takes (so a test can look at it while it is running).
+    update_delay: Mutex<Duration>,
+    updated: Mutex<Vec<String>>,
+    rolled_back: Mutex<Vec<String>>,
+    /// "dead": the update "succeeds" but the edge never comes back. "other-identity": it comes back
+    /// claiming a different certificate. Anything else: a normal update.
+    update_mode: Mutex<String>,
     dir: std::path::PathBuf,
 }
 
@@ -195,6 +204,36 @@ impl Bootstrapper for Machines {
         let out = Installed { cert_pem: h.cert_pem.clone(), mgmt_port: h.addr.port(), wg_public_key: None };
         self.edges.lock().await.insert(t.edge_id.clone(), h);
         Ok(out)
+    }
+    async fn update(&self, t: &Target, ctx: &InstallCtx) -> anyhow::Result<Installed> {
+        let delay = *self.update_delay.lock().unwrap();
+        sleep(delay).await;
+        if let Some(m) = self.fail_update.lock().unwrap().clone() {
+            anyhow::bail!(m);
+        }
+        // "Updating" an in-process edge: stop it and start it again from its own data directory.
+        let old = self.edges.lock().await.remove(&t.edge_id).ok_or_else(|| anyhow::anyhow!("no such machine"))?;
+        let addr = old.addr;
+        let mode = self.update_mode.lock().unwrap().clone();
+        if mode == "dead" {
+            let cert = old.cert_pem.clone();
+            old.stop().await;
+            return Ok(Installed { cert_pem: cert, mgmt_port: addr.port(), wg_public_key: None });
+        }
+        if mode == "other-identity" {
+            self.edges.lock().await.insert(t.edge_id.clone(), old);
+            return Ok(Installed { cert_pem: edge_lbd::pki::self_signed_server().unwrap().cert, mgmt_port: addr.port(), wg_public_key: None });
+        }
+        old.stop().await;
+        let h = start_edge(&self.dir.join(&t.edge_id), addr, &ctx.ca_pem).await;
+        let out = Installed { cert_pem: h.cert_pem.clone(), mgmt_port: h.addr.port(), wg_public_key: None };
+        self.edges.lock().await.insert(t.edge_id.clone(), h);
+        self.updated.lock().unwrap().push(t.edge_id.clone());
+        Ok(out)
+    }
+    async fn rollback(&self, t: &Target) -> anyhow::Result<()> {
+        self.rolled_back.lock().unwrap().push(t.edge_id.clone());
+        Ok(())
     }
     async fn uninstall(&self, t: &Target) -> anyhow::Result<()> {
         if let Some(h) = self.edges.lock().await.remove(&t.edge_id) {
@@ -261,6 +300,7 @@ fn opts(dir: &std::path::Path, machines: Arc<Machines>, hz: &str, cf: &str) -> O
     o.tick = Duration::from_millis(40);
     o.poll_every = Duration::from_millis(100);
     o.retry_backoff = (Duration::from_millis(30), Duration::from_millis(200));
+    o.update_wait = Duration::from_secs(3);
     o
 }
 
@@ -648,5 +688,124 @@ async fn the_controller_gathers_connection_logs_from_every_edge() {
     let west = view.sources.iter().find(|s| s.id == "us-west").unwrap();
     assert!(west.error.is_none() && west.returned > 0);
     assert!(view.entries.iter().all(|e| e.edge == "us-west"));
+    let _ = std::fs::remove_dir_all(&r.dir);
+}
+
+fn update_of(ctl: &Controller, id: &str) -> edge_lbd::controller::update::UpdateView {
+    ctl.edges().into_iter().find(|e| e.edge.id == id).unwrap().update
+}
+
+#[tokio::test]
+async fn an_edge_is_updated_from_the_controller_without_ever_leaving_service() {
+    use edge_lbd::controller::update::UpdateState;
+    let r = rig("update").await;
+    let backend = echo_backend("OK").await;
+    let (pa, pb) = (free_port().await, free_port().await);
+    r.ctl.create_edge("t", hetzner_edge("US East", "us-east")).unwrap();
+    r.ctl.create_edge("t", hetzner_edge("US West", "us-west")).unwrap();
+    wait_for("both edges healthy", || status_of(&r.ctl, "us-east") == Some(EdgeStatus::Healthy) && status_of(&r.ctl, "us-west") == Some(EdgeStatus::Healthy)).await;
+    r.ctl.create_route("t", croute("east-only", "127.0.0.1", pa, backend, &["us-east"])).unwrap();
+    r.ctl.create_route("t", croute("west-only", "127.0.0.2", pb, backend, &["us-west"])).unwrap();
+    wait_for("both routes live", || fetch_ok(format!("127.0.0.1:{pa}").parse().unwrap()) && fetch_ok(format!("127.0.0.2:{pb}").parse().unwrap())).await;
+    let (east, west): (SocketAddr, SocketAddr) = (format!("127.0.0.1:{pa}").parse().unwrap(), format!("127.0.0.2:{pb}").parse().unwrap());
+
+    // These edges run this very build, so there is nothing to update.
+    wait_for("versions are known", || r.ctl.edges().iter().all(|e| e.live.as_ref().is_some_and(|l| l.version.is_some()))).await;
+    assert_eq!(update_of(&r.ctl, "us-east").available, None);
+    assert_eq!(update_of(&r.ctl, "us-east").state, None);
+
+    // An update takes a moment; look at it while it runs.
+    *r.machines.update_delay.lock().unwrap() = Duration::from_millis(700);
+    r.ctl.update_edge("t", "us-east").unwrap();
+    assert_eq!(update_of(&r.ctl, "us-east").state, Some(UpdateState::Running));
+    // One edge at a time, so a rollout can't take every edge down together; and not the same one twice.
+    let err = r.ctl.update_edge("t", "us-west").unwrap_err();
+    assert!(matches!(&err, CtlError::Conflict(m) if m.contains("one edge at a time")), "{err:?}");
+    let err = r.ctl.update_edge("t", "us-east").unwrap_err();
+    assert!(matches!(&err, CtlError::Conflict(m) if m.contains("already being updated")), "{err:?}");
+    // While it runs, the edge isn't mistaken for an outage: the reconciler leaves it alone.
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(status_of(&r.ctl, "us-east"), Some(EdgeStatus::Healthy));
+
+    wait_for("the update to finish", || update_of(&r.ctl, "us-east").state == Some(UpdateState::Done)).await;
+    let v = update_of(&r.ctl, "us-east");
+    assert!(v.message.as_deref().unwrap().contains("reinstalled"), "{v:?}");
+    assert_eq!(*r.machines.updated.lock().unwrap(), ["us-east"]);
+    assert_eq!(status_of(&r.ctl, "us-east"), Some(EdgeStatus::Healthy), "never left service in the controller's eyes");
+    assert_eq!(fetch(east).await, "OK", "its routes came back with it");
+    assert_eq!(fetch(west).await, "OK", "the other edge was never touched");
+    assert!(r.ctl.edges().iter().find(|e| e.edge.id == "us-east").unwrap().edge.log.iter().any(|l| l.msg.contains("reinstalled")), "the edge's own log records it");
+
+    // A failed update leaves the edge exactly as it was, still serving, and says why.
+    *r.machines.update_delay.lock().unwrap() = Duration::ZERO;
+    *r.machines.fail_update.lock().unwrap() = Some("the new version did not start".into());
+    r.ctl.update_edge("t", "us-west").unwrap();
+    wait_for("the failure", || update_of(&r.ctl, "us-west").state == Some(UpdateState::Failed)).await;
+    let v = update_of(&r.ctl, "us-west");
+    assert!(v.message.as_deref().unwrap().contains("did not start") && v.message.as_deref().unwrap().contains("previous version"), "{v:?}");
+    assert_eq!(status_of(&r.ctl, "us-west"), Some(EdgeStatus::Healthy));
+    assert_eq!(fetch(west).await, "OK");
+    assert_eq!(r.machines.updated.lock().unwrap().len(), 1, "no second restart happened");
+
+    // ...and it can simply be tried again.
+    *r.machines.fail_update.lock().unwrap() = None;
+    r.ctl.update_edge("t", "us-west").unwrap();
+    wait_for("the retry", || update_of(&r.ctl, "us-west").state == Some(UpdateState::Done)).await;
+    assert_eq!(fetch(west).await, "OK");
+
+    // The audit trail has the whole story.
+    let actions: Vec<String> = r.ctl.audit.tail(200).iter().map(|v| v["action"].as_str().unwrap().to_string()).collect();
+    for a in ["edge.update", "edge.updated", "edge.update_failed"] {
+        assert!(actions.iter().any(|x| x == a), "missing {a}: {actions:?}");
+    }
+
+    // Edges that aren't serving, and ones that don't exist, can't be updated.
+    assert!(matches!(r.ctl.update_edge("t", "nowhere"), Err(CtlError::NotFound(_))));
+    r.ctl.store.update(|s| s.edges.iter_mut().find(|e| e.id == "us-west").unwrap().status = EdgeStatus::Failed).unwrap();
+    let err = r.ctl.update_edge("t", "us-west").unwrap_err();
+    assert!(matches!(&err, CtlError::Conflict(m) if m.contains("failed")), "{err:?}");
+    let _ = std::fs::remove_dir_all(&r.dir);
+}
+
+
+/// Wait for an update to reach `want`; if it doesn't, say what it was doing instead.
+async fn wait_update(ctl: &Controller, id: &str, want: edge_lbd::controller::update::UpdateState) {
+    for _ in 0..400 {
+        if update_of(ctl, id).state == Some(want) {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for the update to be {want:?}: {:?}; the edge is {:?}", update_of(ctl, id), status_of(ctl, id));
+}
+
+#[tokio::test]
+async fn an_update_the_controller_cannot_confirm_is_rolled_back() {
+    use edge_lbd::controller::update::UpdateState;
+    // The updater reports success, but the edge never answers again.
+    let r = rig("update-dead").await;
+    r.ctl.create_edge("t", hetzner_edge("US East", "us-east")).unwrap();
+    wait_for("healthy", || status_of(&r.ctl, "us-east") == Some(EdgeStatus::Healthy)).await;
+    *r.machines.update_mode.lock().unwrap() = "dead".into();
+    r.ctl.update_edge("t", "us-east").unwrap();
+    wait_update(&r.ctl, "us-east", UpdateState::Failed).await;
+    let m = update_of(&r.ctl, "us-east").message.unwrap();
+    assert!(m.contains("did not answer") && m.contains("put the previous version back"), "{m}");
+    assert_eq!(*r.machines.rolled_back.lock().unwrap(), ["us-east"], "the controller asked for the rollback");
+    let _ = std::fs::remove_dir_all(&r.dir);
+
+    // The edge answers, but it is not the edge that was pinned: it must not be trusted, and is rolled back.
+    let r = rig("update-identity").await;
+    r.ctl.create_edge("t", hetzner_edge("US East", "us-east")).unwrap();
+    wait_for("healthy", || status_of(&r.ctl, "us-east") == Some(EdgeStatus::Healthy)).await;
+    *r.machines.update_mode.lock().unwrap() = "other-identity".into();
+    r.ctl.update_edge("t", "us-east").unwrap();
+    wait_update(&r.ctl, "us-east", UpdateState::Failed).await;
+    let m = update_of(&r.ctl, "us-east").message.unwrap();
+    assert!(m.contains("different identity") && m.contains("put the previous version back"), "{m}");
+    assert_eq!(*r.machines.rolled_back.lock().unwrap(), ["us-east"]);
+    let pinned = r.ctl.store.read(|s| s.edge("us-east").unwrap().mgmt_fingerprint.clone());
+    assert!(pinned.is_some(), "the pin is untouched");
+    assert_eq!(status_of(&r.ctl, "us-east"), Some(EdgeStatus::Healthy), "and the real edge is still being served by the controller");
     let _ = std::fs::remove_dir_all(&r.dir);
 }

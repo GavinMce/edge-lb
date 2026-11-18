@@ -1,6 +1,6 @@
 [package]
 name = "edge-lb-desktop"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "edge-lb controller as a Windows desktop app"
 publish = false

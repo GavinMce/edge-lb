@@ -16,6 +16,7 @@ pub mod model;
 pub mod providers;
 pub mod sites;
 pub mod store;
+pub mod update;
 
 use crate::config::{self, Route};
 use audit::Audit;
@@ -57,6 +58,9 @@ pub struct Options {
     /// How this controller is run, so the UI can say how to change its startup options: `desktop`
     /// (the Windows app), `server` (installed by install-controller.sh). `None` for anything else.
     pub deployment: Option<String>,
+    /// How long an edge that was just updated gets to answer over its management channel before the
+    /// update is undone.
+    pub update_wait: Duration,
 }
 
 /// Only the deployments the UI has instructions for; anything else is treated as "unknown".
@@ -79,6 +83,7 @@ impl Options {
             retry_backoff: (Duration::from_secs(2), Duration::from_secs(30)),
             gateway: None,
             deployment: std::env::var("EDGE_LB_DEPLOYMENT").ok().and_then(|v| known_deployment(&v)),
+            update_wait: Duration::from_secs(45),
         }
     }
 }
@@ -156,6 +161,8 @@ pub struct Controller {
     /// Serialises changes to the listener so two requests can't interleave stop and start.
     pub(crate) gateway_op: tokio::sync::Mutex<()>,
     pub(crate) gw_live: RwLock<HashMap<String, GwLive>>,
+    /// Updates that were started, by `edge:<id>` or `site:<id>`, and how they are going. Memory only.
+    pub(crate) updates: Mutex<HashMap<String, update::UpdateRun>>,
 }
 
 // ---- API-facing types ------------------------------------------------------------------------
@@ -178,6 +185,8 @@ pub struct EdgeView {
     #[serde(flatten)]
     pub edge: Edge,
     pub live: Option<Live>,
+    /// Whether it runs an older version than this controller, and how an update is going.
+    pub update: update::UpdateView,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -325,6 +334,7 @@ impl Controller {
             gateway_error: Mutex::new(None),
             gateway_op: tokio::sync::Mutex::new(()),
             gw_live: RwLock::new(HashMap::new()),
+            updates: Mutex::new(HashMap::new()),
             opts,
         });
         if c.store.read(|s| s.gateway_tls.is_none()) {
@@ -390,7 +400,7 @@ impl Controller {
 
     pub fn edges(&self) -> Vec<EdgeView> {
         let live = self.live.read().unwrap();
-        self.store.read(|s| s.edges.iter().map(|e| EdgeView { edge: e.clone(), live: live.get(&e.id).cloned() }).collect())
+        self.store.read(|s| s.edges.iter().map(|e| EdgeView { edge: e.clone(), live: live.get(&e.id).cloned(), update: self.edge_update_view(e, live.get(&e.id)) }).collect())
     }
 
     pub fn routes(&self) -> Vec<CRoute> {

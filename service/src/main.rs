@@ -34,6 +34,34 @@ enum Cmd {
     Gateway(GatewayArgs),
     /// Root helper on an edge: applies the WireGuard state the edge writes. Installed by the controller.
     WgApply(WgApplyArgs),
+    /// Root helper on a gateway: installs the version the controller offered, and undoes it if that fails.
+    GatewayUpdate(GatewayUpdateArgs),
+}
+
+#[derive(Parser, Debug)]
+struct GatewayUpdateArgs {
+    /// The controller's gateway listener, as host:port.
+    #[arg(long)]
+    controller: String,
+
+    /// SHA-256 fingerprint (hex) of the controller's gateway certificate.
+    #[arg(long)]
+    pin: String,
+
+    #[arg(long, default_value = "/var/lib/edge-lb-gateway")]
+    data_dir: PathBuf,
+
+    /// The installed binary to replace.
+    #[arg(long, default_value = "/usr/local/bin/edge-lbd")]
+    bin: PathBuf,
+
+    /// The systemd unit to restart.
+    #[arg(long, default_value = "edge-lb-gateway")]
+    service: String,
+
+    /// How long the new version gets to reach the controller before it is rolled back.
+    #[arg(long, default_value_t = 90)]
+    wait_secs: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -52,6 +80,11 @@ struct GatewayArgs {
 
     #[arg(long, default_value_t = 5)]
     interval_secs: u64,
+
+    /// This install has the updater unit: tell the controller updates can be started from its UI,
+    /// and ask the updater to act when one is offered.
+    #[arg(long)]
+    self_update: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -355,11 +388,33 @@ async fn gateway(args: GatewayArgs) -> Result<()> {
         data_dir: args.data_dir,
         interval: Duration::from_secs(args.interval_secs.clamp(1, 300)),
         host: Arc::new(edge_lbd::gateway::RealHost),
+        self_update: args.self_update,
     });
     tokio::select! {
         r = run => r,
         _ = shutdown_signal() => Ok(()),
     }
+}
+
+async fn gateway_update(args: GatewayUpdateArgs) -> Result<()> {
+    if !edge_lbd::gateway::valid_pin(&args.pin) {
+        bail!("--pin must be the 64-character hex SHA-256 fingerprint of the controller's gateway certificate");
+    }
+    if !edge_lbd::controller::sites::valid_hostport(&args.controller) {
+        bail!("--controller must be host:port");
+    }
+    // The controller names builds the way `uname -m` does.
+    let arch = edge_lbd::controller::agents::normalize_arch(std::env::consts::ARCH).ok_or_else(|| anyhow::anyhow!("no edge-lb build exists for this CPU ({})", std::env::consts::ARCH))?;
+    edge_lbd::gateway_update::run(edge_lbd::gateway_update::Options {
+        controller: args.controller,
+        pin: args.pin,
+        data_dir: args.data_dir,
+        bin: args.bin,
+        arch: arch.to_string(),
+        wait: Duration::from_secs(args.wait_secs.clamp(10, 600)),
+        host: Arc::new(edge_lbd::gateway_update::RealHost { service: args.service }),
+    })
+    .await
 }
 
 async fn wg_apply(args: WgApplyArgs) -> Result<()> {
@@ -385,6 +440,8 @@ async fn main() -> Result<()> {
         Cmd::Gateway(a) => gateway(a).await,
         #[cfg(unix)]
         Cmd::WgApply(a) => wg_apply(a).await,
+        #[cfg(unix)]
+        Cmd::GatewayUpdate(a) => gateway_update(a).await,
         #[cfg(not(unix))]
         _ => bail!("only `controller` runs on this platform: edges, gateways and standalone mode are Linux-only. The controller installs them on your Linux machines for you."),
     }

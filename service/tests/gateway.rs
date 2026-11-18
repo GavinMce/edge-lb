@@ -293,6 +293,11 @@ impl HostWg for MockHost {
 }
 
 fn spawn_gateway(ctl: &Controller, dir: &Path, host: Arc<MockHost>, pin: Option<String>) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    spawn_gateway_with(ctl, dir, host, pin, false)
+}
+
+/// `self_update`: this gateway was installed with the updater unit.
+fn spawn_gateway_with(ctl: &Controller, dir: &Path, host: Arc<MockHost>, pin: Option<String>, self_update: bool) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let (_, hostport, fp) = pinned_http(ctl);
     tokio::spawn(gateway::run(gateway::Options {
         controller: hostport,
@@ -300,6 +305,7 @@ fn spawn_gateway(ctl: &Controller, dir: &Path, host: Arc<MockHost>, pin: Option<
         data_dir: dir.to_path_buf(),
         interval: Duration::from_millis(100),
         host,
+        self_update,
     }))
 }
 
@@ -718,4 +724,360 @@ async fn startup_options_fix_the_listener_so_settings_cannot_fight_them() {
     }
     assert!(accepts(p), "still serving");
     ctl.stop();
+}
+// ---- updating gateways ---------------------------------------------------------------------------------
+
+use edge_lbd::controller::update::{UpdateState, AGENT_VERSION};
+use edge_lbd::gateway_update;
+use sha2::{Digest, Sha256};
+
+/// Enrol a gateway through the real agent, then stop the agent: tests drive its sync by hand from here.
+/// Returns its data directory and its secret.
+async fn enrolled_gateway(ctl: &Arc<Controller>, d: &Path, site_id: &str) -> (PathBuf, String) {
+    let token = token_of(&ctl.start_enrolment("t", site_id).unwrap().command);
+    let gwdir = d.join(format!("gw-{site_id}"));
+    std::fs::create_dir_all(&gwdir).unwrap();
+    std::fs::write(gwdir.join("enrol-token"), format!("{token}\n")).unwrap();
+    let task = spawn_gateway_with(ctl, &gwdir, Arc::new(MockHost::default()), None, true);
+    wait_for("the gateway to enrol and sync", || ctl.sites().iter().any(|s| s.id == site_id && s.gateway.enrolled && s.gateway.online)).await;
+    task.abort();
+    let _ = task.await;
+    let secret = serde_json::from_slice::<Value>(&std::fs::read(gwdir.join("identity.json")).unwrap()).unwrap()["secret"].as_str().unwrap().to_string();
+    (gwdir, secret)
+}
+
+async fn raw_sync(ctl: &Controller, secret: &str, body: Value) -> Value {
+    let (http, host, _) = pinned_http(ctl);
+    let r = http.post(format!("https://{host}/gw/v1/sync")).bearer_auth(secret).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    r.json().await.unwrap()
+}
+
+fn gw_update(ctl: &Controller) -> edge_lbd::controller::update::UpdateView {
+    ctl.sites()[0].gateway.update.clone()
+}
+
+#[tokio::test]
+async fn a_gateway_is_only_offered_an_update_when_asked_and_the_outcome_is_tracked() {
+    let (ctl, d) = controller("upd-offer").await;
+    site(&ctl, "Home", &["192.168.1.0/24"]).unwrap();
+    let (_gw, secret) = enrolled_gateway(&ctl, &d, "home").await;
+    assert!(ctl.sites()[0].gateway.self_update, "an install with the updater says so");
+
+    // Nobody asked: a gateway on an old version is told it is behind, but is not told to move.
+    let r = raw_sync(&ctl, &secret, json!({"version": "0.0.1", "caps": ["self-update"], "handshakes": []})).await;
+    assert!(r.get("update").is_none(), "no update was requested: {r}");
+    assert_eq!(gw_update(&ctl).available.as_deref(), Some(AGENT_VERSION));
+    assert_eq!(gw_update(&ctl).state, None);
+
+    // Asked: the next sync carries the offer.
+    ctl.update_gateway("t", "home").unwrap();
+    assert_eq!(gw_update(&ctl).state, Some(UpdateState::Running));
+    let r = raw_sync(&ctl, &secret, json!({"version": "0.0.1", "caps": ["self-update"], "handshakes": []})).await;
+    assert_eq!(r["update"]["version"], AGENT_VERSION);
+    assert!(gw_update(&ctl).message.unwrap().contains("installing"));
+    // Asking twice doesn't start two.
+    assert!(matches!(ctl.update_gateway("t", "home"), Err(CtlError::Conflict(m)) if m.contains("already")));
+
+    // The updater reports failure: the offer stops, the reason is shown, and it can be tried again.
+    let r = raw_sync(&ctl, &secret, json!({"version": "0.0.1", "caps": ["self-update"], "handshakes": [], "update_result": {"version": "9.9.9", "ok": false, "error": "9.9.9 did not complete a sync"}})).await;
+    assert!(r.get("update").is_none(), "{r}");
+    assert_eq!(gw_update(&ctl).state, Some(UpdateState::Failed));
+    assert!(gw_update(&ctl).message.unwrap().contains("did not complete a sync"));
+
+    ctl.update_gateway("t", "home").unwrap();
+    let r = raw_sync(&ctl, &secret, json!({"version": AGENT_VERSION, "caps": ["self-update"], "handshakes": []})).await;
+    assert!(r.get("update").is_none(), "already there: {r}");
+    let v = gw_update(&ctl);
+    assert_eq!(v.state, Some(UpdateState::Done));
+    assert_eq!(v.message.as_deref(), Some(format!("updated to v{AGENT_VERSION}").as_str()));
+    assert_eq!(v.available, None, "up to date now");
+
+    let actions: Vec<String> = ctl.audit.tail(50).iter().map(|v| v["action"].as_str().unwrap().to_string()).collect();
+    assert!(actions.iter().any(|a| a == "gateway.update"), "{actions:?}");
+}
+
+#[tokio::test]
+async fn a_gateway_that_cannot_update_itself_is_told_what_to_do_instead() {
+    let (ctl, d) = controller("upd-guards").await;
+    site(&ctl, "Home", &["192.168.1.0/24"]).unwrap();
+    site(&ctl, "Cabin", &["192.168.2.0/24"]).unwrap();
+    let (_gw, secret) = enrolled_gateway(&ctl, &d, "home").await;
+
+    assert!(matches!(ctl.update_gateway("t", "nowhere"), Err(CtlError::NotFound(_))));
+    assert!(matches!(ctl.update_gateway("t", "cabin"), Err(CtlError::Conflict(m)) if m.contains("no gateway yet")));
+
+    // Enrolled but never heard from.
+    ctl.store.update(|s| s.sites[1].gateway.public_key = Some(K_GW.into())).unwrap();
+    assert!(matches!(ctl.update_gateway("t", "cabin"), Err(CtlError::Conflict(m)) if m.contains("offline")));
+
+    // An older gateway (no updater unit) syncs without the capability: it must re-enrol once.
+    raw_sync(&ctl, &secret, json!({"version": "0.1.2", "handshakes": []})).await;
+    assert!(!ctl.sites()[0].gateway.self_update);
+    let err = ctl.update_gateway("t", "home").unwrap_err();
+    assert!(matches!(&err, CtlError::Conflict(m) if m.contains("Re-enrol")), "{err:?}");
+    assert_eq!(gw_update(&ctl).state, None, "nothing was started");
+    // A gateway can't claim a capability with an absurd name.
+    raw_sync(&ctl, &secret, json!({"version": "0.1.2", "caps": ["x".repeat(500)], "handshakes": []})).await;
+    assert!(!ctl.sites()[0].gateway.self_update);
+}
+
+#[tokio::test]
+async fn the_agent_reports_what_the_updater_left_and_marks_every_good_sync() {
+    let (ctl, d) = controller("upd-agent").await;
+    site(&ctl, "Home", &["192.168.1.0/24"]).unwrap();
+    let token = token_of(&ctl.start_enrolment("t", "home").unwrap().command);
+    let gwdir = d.join("gw");
+    std::fs::create_dir_all(&gwdir).unwrap();
+    std::fs::write(gwdir.join("enrol-token"), format!("{token}\n")).unwrap();
+    // The updater tried and failed before this agent started: the controller should hear about it.
+    std::fs::write(gwdir.join("update-result.json"), br#"{"version":"9.9.9","ok":false,"error":"9.9.9 did not complete a sync with the controller"}"#).unwrap();
+    let task = spawn_gateway_with(&ctl, &gwdir, Arc::new(MockHost::default()), None, true);
+    wait_for("enrolled and online", || ctl.sites()[0].gateway.enrolled && ctl.sites()[0].gateway.online).await;
+
+    // The marker the updater waits for names the version that wrote it.
+    wait_for("the sync marker", || std::fs::read_to_string(gwdir.join("synced")).is_ok_and(|s| s.starts_with(&format!("{} ", gateway::VERSION)))).await;
+    // The result is handed over once and then removed, so it isn't reported forever.
+    wait_for("the result to be consumed", || !gwdir.join("update-result.json").exists()).await;
+
+    // An agent already on the controller's version is never offered anything, so no request is written.
+    ctl.update_gateway("t", "home").unwrap();
+    wait_for("the request to resolve", || gw_update(&ctl).state == Some(UpdateState::Done)).await;
+    assert!(gw_update(&ctl).message.unwrap().contains("already running"));
+    assert!(!gwdir.join("update-request").exists());
+    task.abort();
+
+    // Without the updater unit, none of this happens.
+    let (ctl2, d2) = controller("upd-agent-off").await;
+    site(&ctl2, "Home", &["192.168.1.0/24"]).unwrap();
+    let token = token_of(&ctl2.start_enrolment("t", "home").unwrap().command);
+    let gwdir2 = d2.join("gw");
+    std::fs::create_dir_all(&gwdir2).unwrap();
+    std::fs::write(gwdir2.join("enrol-token"), format!("{token}\n")).unwrap();
+    let task2 = spawn_gateway_with(&ctl2, &gwdir2, Arc::new(MockHost::default()), None, false);
+    wait_for("enrolled and online", || ctl2.sites()[0].gateway.enrolled && ctl2.sites()[0].gateway.online).await;
+    sleep(Duration::from_millis(300)).await;
+    assert!(!ctl2.sites()[0].gateway.self_update);
+    assert!(!gwdir2.join("synced").exists(), "no updater, no marker");
+    task2.abort();
+}
+
+#[tokio::test]
+async fn the_update_binary_is_served_only_to_a_gateway_that_proves_who_it_is() {
+    let (ctl, d) = controller("upd-bin").await;
+    site(&ctl, "Home", &["192.168.1.0/24"]).unwrap();
+    let (_gw, secret) = enrolled_gateway(&ctl, &d, "home").await;
+    let (http, host, _) = pinned_http(&ctl);
+    let url = |arch: &str| format!("https://{host}/gw/v1/update?arch={arch}");
+
+    let ok = http.get(url("x86_64")).bearer_auth(&secret).send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+    let stated = ok.headers()["x-edge-lb-sha256"].to_str().unwrap().to_string();
+    let body = ok.bytes().await.unwrap();
+    assert_eq!(&body[..], b"#!fake-binary");
+    assert_eq!(stated, Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect::<String>(), "the checksum covers exactly what was sent");
+
+    assert_eq!(http.get(url("x86_64")).send().await.unwrap().status(), 401, "no credentials");
+    assert_eq!(http.get(url("x86_64")).bearer_auth("wrong").send().await.unwrap().status(), 401);
+    assert_eq!(http.get(url("x86_64")).bearer_auth("00".repeat(32)).send().await.unwrap().status(), 401);
+    // Enrolment tokens open the installer, not the update download.
+    let token = token_of(&ctl.start_enrolment("t", "home").unwrap().command);
+    assert_eq!(http.get(url("x86_64")).bearer_auth(&token).send().await.unwrap().status(), 401);
+    // The architecture is only a lookup key.
+    for arch in ["aarch64", "..%2F..%2Fetc%2Fpasswd", "x86_64%2F..%2Fx86_64", "", "%2e%2e"] {
+        assert_eq!(http.get(url(arch)).bearer_auth(&secret).send().await.unwrap().status(), 422, "{arch:?}");
+    }
+    assert_eq!(http.get(format!("https://{host}/gw/v1/update")).bearer_auth(&secret).send().await.unwrap().status(), 422, "no arch at all");
+}
+
+// The updater, with only the restart and the version check faked.
+
+struct FakeHost {
+    dir: PathBuf,
+    version: Mutex<Result<String, String>>,
+    /// What the "new" agent would write to its sync marker after a restart (None: it never syncs).
+    syncs_as: Mutex<Option<String>>,
+    restarts: Mutex<u32>,
+}
+
+impl FakeHost {
+    fn new(dir: &Path, version: Result<&str, &str>, syncs_as: Option<&str>) -> Arc<FakeHost> {
+        Arc::new(FakeHost { dir: dir.to_path_buf(), version: Mutex::new(version.map(String::from).map_err(String::from)), syncs_as: Mutex::new(syncs_as.map(String::from)), restarts: Mutex::new(0) })
+    }
+}
+
+#[async_trait]
+impl gateway_update::Host for FakeHost {
+    async fn restart(&self) -> anyhow::Result<()> {
+        *self.restarts.lock().unwrap() += 1;
+        if let Some(v) = self.syncs_as.lock().unwrap().clone() {
+            std::fs::write(self.dir.join("synced"), format!("{v} 1\n"))?;
+        }
+        Ok(())
+    }
+    async fn version_output(&self, _binary: &Path) -> anyhow::Result<String> {
+        self.version.lock().unwrap().clone().map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+struct UpdaterRig {
+    ctl: Arc<Controller>,
+    gwdir: PathBuf,
+    bin: PathBuf,
+}
+
+async fn updater_rig(tag: &str) -> UpdaterRig {
+    let (ctl, d) = controller(tag).await;
+    site(&ctl, "Home", &["192.168.1.0/24"]).unwrap();
+    let (gwdir, _) = enrolled_gateway(&ctl, &d, "home").await;
+    let bin = d.join("bin").join("edge-lbd");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, "OLD BINARY").unwrap();
+    std::fs::write(gwdir.join("update-request"), "9.9.9\n").unwrap();
+    UpdaterRig { ctl, gwdir, bin }
+}
+
+impl UpdaterRig {
+    async fn run(&self, host: Arc<FakeHost>, wait_secs: u64, pin: Option<String>) {
+        let (_, hostport, fp) = pinned_http(&self.ctl);
+        gateway_update::run(gateway_update::Options {
+            controller: hostport,
+            pin: pin.unwrap_or(fp),
+            data_dir: self.gwdir.clone(),
+            bin: self.bin.clone(),
+            arch: "x86_64".into(),
+            wait: Duration::from_secs(wait_secs),
+            host,
+        })
+        .await
+        .unwrap();
+    }
+
+    fn result(&self) -> Value {
+        serde_json::from_slice(&std::fs::read(self.gwdir.join("update-result.json")).expect("the updater always leaves a result")).unwrap()
+    }
+
+    fn old(&self) -> PathBuf {
+        PathBuf::from(format!("{}.old", self.bin.display()))
+    }
+
+    fn new_file(&self) -> PathBuf {
+        PathBuf::from(format!("{}.new", self.bin.display()))
+    }
+}
+
+#[tokio::test]
+async fn the_updater_installs_what_the_controller_serves_once_the_new_version_syncs() {
+    let r = updater_rig("upd-run-ok").await;
+    let host = FakeHost::new(&r.gwdir, Ok("edge-lbd 9.9.9\n"), Some("9.9.9"));
+    r.run(host.clone(), 5, None).await;
+
+    assert_eq!(std::fs::read_to_string(&r.bin).unwrap(), "#!fake-binary", "the controller's binary is in place");
+    assert_eq!(std::fs::read_to_string(r.old()).unwrap(), "OLD BINARY", "the previous one is kept");
+    assert!(!r.new_file().exists());
+    assert_eq!(*host.restarts.lock().unwrap(), 1);
+    let res = r.result();
+    assert_eq!((res["ok"].as_bool(), res["version"].as_str()), (Some(true), Some("9.9.9")), "{res}");
+    assert!(!r.gwdir.join("update-request").exists(), "the request is taken first, so systemd can't loop on it");
+    #[cfg(unix)]
+    assert_eq!(std::fs::metadata(&r.bin).unwrap().permissions().mode() & 0o777, 0o755);
+}
+
+#[tokio::test]
+async fn a_new_version_that_never_reaches_the_controller_is_rolled_back() {
+    let r = updater_rig("upd-run-rollback").await;
+    let host = FakeHost::new(&r.gwdir, Ok("edge-lbd 9.9.9\n"), None);
+    r.run(host.clone(), 1, None).await;
+
+    assert_eq!(std::fs::read_to_string(&r.bin).unwrap(), "OLD BINARY", "the previous binary is back");
+    assert_eq!(*host.restarts.lock().unwrap(), 2, "restarted onto the new one, then onto the old one again");
+    let res = r.result();
+    assert_eq!(res["ok"], false);
+    let err = res["error"].as_str().unwrap();
+    assert!(err.contains("did not complete a sync") && err.contains("went back"), "{err}");
+    assert_eq!(res["version"], "9.9.9", "the controller is told which version was tried");
+
+    // Another version's marker doesn't count as the new version being healthy.
+    let r = updater_rig("upd-run-wrong-marker").await;
+    let host = FakeHost::new(&r.gwdir, Ok("edge-lbd 9.9.9\n"), Some("0.0.1"));
+    r.run(host, 1, None).await;
+    assert_eq!(std::fs::read_to_string(&r.bin).unwrap(), "OLD BINARY");
+    assert_eq!(r.result()["ok"], false);
+}
+
+#[tokio::test]
+async fn a_binary_that_will_not_run_is_refused_before_anything_is_replaced() {
+    let r = updater_rig("upd-run-broken").await;
+    let host = FakeHost::new(&r.gwdir, Err("exec format error"), Some("9.9.9"));
+    r.run(host.clone(), 2, None).await;
+
+    assert_eq!(std::fs::read_to_string(&r.bin).unwrap(), "OLD BINARY");
+    assert!(!r.old().exists(), "nothing was backed up because nothing changed");
+    assert!(!r.new_file().exists(), "the rejected download is not left lying around");
+    assert_eq!(*host.restarts.lock().unwrap(), 0, "the running service was never touched");
+    let res = r.result();
+    assert_eq!(res["ok"], false);
+    assert!(res["error"].as_str().unwrap().contains("does not run"), "{res}");
+}
+
+#[tokio::test]
+async fn the_updater_does_nothing_without_a_request_and_nothing_to_do_when_already_current() {
+    let r = updater_rig("upd-run-noop").await;
+    std::fs::remove_file(r.gwdir.join("update-request")).unwrap();
+    let host = FakeHost::new(&r.gwdir, Ok("edge-lbd 9.9.9\n"), Some("9.9.9"));
+    r.run(host.clone(), 2, None).await;
+    assert_eq!(std::fs::read_to_string(&r.bin).unwrap(), "OLD BINARY");
+    assert!(!r.gwdir.join("update-result.json").exists(), "no request, no result");
+    assert_eq!(*host.restarts.lock().unwrap(), 0);
+
+    // The served binary turns out to be the version already running: say so, change nothing.
+    std::fs::write(r.gwdir.join("update-request"), "x\n").unwrap();
+    let host = FakeHost::new(&r.gwdir, Ok(&format!("edge-lbd {}\n", gateway::VERSION)), Some("x"));
+    r.run(host.clone(), 2, None).await;
+    assert_eq!(std::fs::read_to_string(&r.bin).unwrap(), "OLD BINARY");
+    assert_eq!(*host.restarts.lock().unwrap(), 0);
+    assert_eq!(r.result()["ok"], true);
+}
+
+#[tokio::test]
+async fn the_updater_trusts_only_the_controller_it_was_installed_for() {
+    // The wrong pin: it never gets a binary.
+    let r = updater_rig("upd-run-pin").await;
+    let host = FakeHost::new(&r.gwdir, Ok("edge-lbd 9.9.9\n"), Some("9.9.9"));
+    r.run(host.clone(), 2, Some("00".repeat(32))).await;
+    assert_eq!(std::fs::read_to_string(&r.bin).unwrap(), "OLD BINARY");
+    assert!(r.result()["error"].as_str().unwrap().contains("cannot reach the controller"), "{}", r.result());
+
+    // A gateway that was never enrolled has no secret to ask with.
+    let r = updater_rig("upd-run-noid").await;
+    std::fs::remove_file(r.gwdir.join("identity.json")).unwrap();
+    let host = FakeHost::new(&r.gwdir, Ok("edge-lbd 9.9.9\n"), Some("9.9.9"));
+    r.run(host, 2, None).await;
+    assert!(r.result()["error"].as_str().unwrap().contains("not enrolled"), "{}", r.result());
+
+    // A secret the controller doesn't know (the gateway was re-enrolled elsewhere) is refused.
+    let r = updater_rig("upd-run-badsecret").await;
+    std::fs::write(r.gwdir.join("identity.json"), r#"{"secret":"deadbeef","site":"home"}"#).unwrap();
+    let host = FakeHost::new(&r.gwdir, Ok("edge-lbd 9.9.9\n"), Some("9.9.9"));
+    r.run(host.clone(), 2, None).await;
+    assert_eq!(std::fs::read_to_string(&r.bin).unwrap(), "OLD BINARY");
+    assert!(r.result()["error"].as_str().unwrap().contains("401"), "{}", r.result());
+    assert_eq!(*host.restarts.lock().unwrap(), 0);
+}
+
+#[test]
+fn the_gateway_installer_sets_up_the_updater_and_tells_the_agent_about_it() {
+    let sha = "ab".repeat(32);
+    let pin = format!("sha256//{}=", "A".repeat(43));
+    let script = edge_lbd::controller::sites::render_install_script("h.test:7444", &"cd".repeat(32), &pin, &"ef".repeat(32), &[("x86_64", sha)]).unwrap();
+    assert!(script.contains("--data-dir /var/lib/edge-lb-gateway --self-update"), "the agent must be told it has an updater");
+    assert!(script.contains("edge-lb-gateway-update.service") && script.contains("edge-lb-gateway-update.path"));
+    assert!(script.contains("PathExists=/var/lib/edge-lb-gateway/update-request"));
+    assert!(script.contains("gateway-update --controller h.test:7444"), "the updater talks to the same controller");
+    assert!(script.contains("systemctl enable --now edge-lb-gateway-update.path"));
+    assert!(!script.contains('@'), "unreplaced placeholder");
+    // The gateway's own unit stays sandboxed: it is not given write access to its binary.
+    let gw_unit = script.split("edge-lb-gateway.service <<'UNIT'").nth(1).unwrap().split("\nUNIT").next().unwrap();
+    assert!(gw_unit.contains("ProtectSystem=strict") && gw_unit.contains("ReadWritePaths=/var/lib/edge-lb-gateway\n"), "{gw_unit}");
+    assert!(!gw_unit.contains("/usr/local/bin") || gw_unit.contains("ExecStart=/usr/local/bin/edge-lbd gateway"), "{gw_unit}");
 }

@@ -277,6 +277,34 @@ headers or status codes. (That is also why it can't be a web application firewal
 carrying traffic, and each site box lists its tunnel to every edge. Point at a box to trace its path, click it to
 open its page.
 
+## Updating edges and gateways
+
+The edge and gateway software a controller installs is the controller's own release, so "up to date" means
+"the same version as the controller". The Edges and Sites pages show **Update to vX.Y.Z** on anything older, a
+count in the header, and an **Update** button. Nothing updates by itself: starting one is always your decision.
+Machines that are *newer* than the controller are left alone.
+
+- **Edges** are updated by the controller over SSH, the way they were installed. It uploads the new binary,
+  checks that it runs on that machine, keeps the old binary and units beside it, rewrites the units from the
+  current template, restarts the edge and waits for it to come up. If it doesn't, the script **puts the old
+  version back by itself**; and if the edge starts but the controller can't then reach it over mTLS (or it
+  presents a different identity), the controller asks for the rollback. The edge keeps its identity, routes
+  and WireGuard key. Connections through it are cut for a few seconds, and while it updates the controller
+  doesn't mistake that for an outage. **One edge at a time**, so a rollout can't take every edge down together.
+- **Gateways** only dial out, so they are *asked*. The controller marks the update as wanted; the gateway sees
+  that in its next check-in and asks a small root-owned updater (`edge-lbd gateway-update`, started by a systemd
+  path unit) to do it. The updater downloads the binary **from the controller** over the pinned TLS channel with
+  the gateway's own secret, checks it against the checksum the controller states, makes sure it runs, swaps it
+  in, restarts the gateway and waits for *the new version* to complete a sync with the controller. If it
+  doesn't within 90 seconds, the old binary goes back. A compromised gateway process can ask for an update but
+  can never choose what gets installed, and its own service keeps its read-only filesystem. Its tunnels drop for
+  a few seconds.
+- **Gateways installed before this existed** have no updater. The Sites page says so; re-enrol them once
+  (**Re-enrol gateway**) and later updates are one click. An update replaces a gateway's *binary*; a change to
+  its systemd unit in a future release still needs a re-enrol.
+- What was asked for and how it went is kept in memory (the controller's Activity log has the permanent record),
+  and a failure shows the reason on the card.
+
 ## Security model
 
 - **Controller ⇄ edge** is mutual TLS with a private PKI: the controller owns a CA and signs its own client
@@ -319,6 +347,7 @@ Sign in (`POST /api/login`), then send the cookie plus `X-EdgeLB: 1`.
 | `GET/POST /api/sites` · `PUT/DELETE /api/sites/{id}` · `POST …/{id}/enrol` | sites, and the one-time gateway enrolment command |
 | `GET/POST /api/routes` · `PUT/DELETE /api/routes/{id}` | route + `"edges": [...]` scope (empty = all) + `"site"` (targets inside that site) |
 | `GET/PUT /api/settings` · `GET /api/ssh-key` · `GET /api/audit` · `POST /api/password` | |
+| `POST /api/edges/{id}/update` · `POST /api/sites/{id}/update` | start updating an edge, or ask a site's gateway to update itself (`202`; progress is in `/api/status` under each edge's and gateway's `update`) |
 | `GET /api/logs?edge=&route=&outcome=&client=&host=&limit=` | recent connections from the edges, newest first, plus how each edge answered. `outcome` is `ok`, `unreachable`, `no_route`, `aborted` or `rejected`; `limit` is 1–1000 (default 200) |
 
 Errors: `401`, `403` (missing header), `404`, `409`, `422` with `{"details": [...]}`, `429` (lockout).
@@ -337,7 +366,7 @@ A listener with domain routes waits `--peek-timeout-ms` (3 s) for the first byte
 
 ## Tests and what was actually exercised
 
-`cargo test` — **146 tests** on Linux (a few Unix-only ones are skipped on Windows): unit, protocol sniffing, the proxy over real sockets, the mTLS channel, the
+`cargo test` — **175 tests** on Linux (a few Unix-only ones are skipped on Windows): unit, protocol sniffing, the proxy over real sockets, the mTLS channel, the
 HTTP APIs, and the fleet lifecycle (mock Hetzner + Cloudflare, real controller, real edges, real traffic:
 create, serve, outage, recovery, drain, delete, DNS fail-static, crash-safe adoption, restart resume).
 The SSH bootstrap runs the **real binary** through the real script with a stub `ssh`.
@@ -373,7 +402,10 @@ that follow the documented API), other distros (Ubuntu, Fedora, RHEL/SELinux), I
 
 - Several gateways per site (failover). Needs an active/standby choice, because two peers can't both own the same
   `AllowedIPs`. IPv6 sites.
-- Upgrading edges installed before WireGuard support in place (today: create them anew).
+- Updating on a schedule or in bulk (today each update is started by hand, one edge at a time), and updating the
+  controller itself (the desktop app uses the MSI; a server uses `install-controller.sh` again).
+- An edge installed before WireGuard support still has to be recreated: an update refreshes what is there and does
+  not add the WireGuard helper.
 - A web application firewall. The edge passes TLS through without decrypting it, so it can't inspect requests;
   what it can do at the connection level (per-route allow/deny lists, per-client rate limits, GeoIP) is not built yet.
   Until then, run a WAF behind the gateway and pass it the real client address with PROXY protocol.
