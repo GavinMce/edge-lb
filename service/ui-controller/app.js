@@ -478,7 +478,7 @@ function renderSites(main) {
     h('div', { class: 'page-head' }, h('h2', null, 'Sites & gateways'), h('button', { class: 'primary', type: 'button', onclick: add }, 'Add site')),
     noListener ? h('div', { class: 'callout' },
       h('div', null, h('strong', null, 'Gateways can\'t connect yet. '), 'This controller isn\'t listening for them.'),
-      h('button', { class: 'small', type: 'button', onclick: openListenerHelp }, 'How to turn it on')) : null,
+      h('button', { class: 'small', type: 'button', onclick: openListenerHelp }, 'Turn on gateways')) : null,
     sites.length
       ? h('div', { class: 'list' }, sites.map(siteCard))
       : h('div', { class: 'empty' }, 'No sites yet. A site is a network behind a gateway, like your home LAN, that your edges can reach over WireGuard without opening any ports at home. Add one and you get a single command to run there; this page shows when it connects.',
@@ -553,66 +553,107 @@ async function copyText(text) {
   try { await navigator.clipboard.writeText(text); toast('Copied'); } catch (_) { toast('Select the text and copy it'); }
 }
 
-function codeBlock(text) {
-  return h('div', { class: 'codebox' },
-    h('pre', { class: 'code' }, text),
-    h('button', { class: 'ghost small', type: 'button', onclick: () => copyText(text) }, 'Copy'));
+/** What to remember about the network once the listener is on, for how this controller is run. */
+function listenerNote() {
+  const how = S.status && S.status.deployment;
+  if (how === 'desktop') return 'The first time it listens, Windows asks whether to let edge-lb through its firewall: allow it for the kind of network this PC is on. This PC has to be on when a gateway is first connected or changed; traffic that already flows keeps flowing without it.';
+  if (how === 'server') return 'Also allow this port inbound in the server\'s firewall and your provider\'s, so the gateway machine can reach it.';
+  return 'Make sure this TCP port is reachable from the gateway machine.';
 }
 
-/** How to make this controller listen for gateways, worded for how it is run. */
-function listenerHelp() {
-  const how = S.status && S.status.deployment;
-  const signedOut = h('p', { class: 'hint' }, 'The controller restarts, so you\'ll be signed in again afterwards. Gateways already running keep their tunnels meanwhile.');
-  if (how === 'desktop') {
-    return [
-      h('p', null, 'Gateways on your network dial in to this controller, and it runs on this PC, so it has to listen on your network (not only on this PC).'),
-      h('ol', null,
-        h('li', null, 'Find this PC\'s address: run ', h('code', null, 'ipconfig'), ' and note the IPv4 address, like 192.168.1.20.'),
-        h('li', null, 'Open (or create) ', h('code', null, '%APPDATA%\\edge-lb\\app.toml'), ' and add the lines below, with your address in place of 192.168.1.20:',
-          codeBlock('[local]\ngateway_listen = "0.0.0.0:7444"\ngateway_host = "192.168.1.20"')),
-        h('li', null, 'Quit edge-lb from the tray icon (right-click, Quit), start it again, and allow the Windows Firewall prompt on private networks.')),
-      h('p', { class: 'hint' }, 'This PC has to be on when a gateway is first connected or changed. Traffic that already flows keeps flowing without it. A controller on an always-on server is better for gateways.'),
-      signedOut,
-    ];
+/**
+ * The gateway listener controls, shared by the Settings page and the gateway dialog (when the
+ * listener is still off). `gw` is `settings.gateway`; `onSaved` runs after a successful change.
+ * Returns the pieces so each place can lay them out in its own frame.
+ */
+function gatewayControls(gw, onSaved) {
+  const locked = gw.locked;
+  const listen = h('input', { value: gw.listen || '0.0.0.0:7444', spellcheck: 'false', disabled: locked });
+  const host = h('input', { value: gw.host || gw.suggested_host || '', placeholder: 'ctl.example.com or 192.168.1.20', spellcheck: 'false', disabled: locked });
+  const errs = h('ul', { class: 'errors', hidden: true });
+  const state = gw.active
+    ? h('p', { class: 'gw-state' }, h('span', { class: 'dot ok' }), `Listening. Gateways are told to dial ${gw.active}.`)
+    : gw.error
+      ? h('p', { class: 'err' }, `The saved listener isn't running: ${gw.error}`)
+      : h('p', { class: 'hint' }, 'Off: no gateway can connect yet.');
+  const fields = [
+    state,
+    locked && h('p', { class: 'hint' }, 'This is fixed by the controller\'s startup options (the command line, app.toml or the installer), so it can\'t be changed here.'),
+    field('Listen on', listen, 'Where this controller waits for gateways. 0.0.0.0 means every network interface. The port has to be free.'),
+    field('Gateways dial', host, gw.host
+      ? 'The name or IPv4 address (optionally :port) gateways use to reach this controller.'
+      : 'Pre-filled with this machine\'s address on its network. Change it if gateways reach it by another name or a public address.'),
+    h('p', { class: 'hint' }, listenerNote()),
+    errs,
+  ].filter(Boolean);
+  const save = h('button', { class: 'primary', type: 'button' }, gw.active || gw.listen ? 'Save' : 'Turn on');
+  save.addEventListener('click', () => changeGateway(save, errs, { gateway: { listen: listen.value.trim(), host: host.value.trim() } }, gw, onSaved));
+  const off = !locked && (gw.active || gw.listen) && h('button', { class: 'danger', type: 'button' }, 'Turn off');
+  if (off) {
+    off.addEventListener('click', () => {
+      const enrolled = ((S.status && S.status.sites) || []).some((s) => s.gateway.enrolled);
+      if (!enrolled) return changeGateway(off, errs, { clear_gateway: true }, gw, onSaved);
+      confirmDialog({
+        title: 'Turn off the gateway listener?',
+        body: 'Gateways that are already installed keep their tunnels, but they can no longer check in, so they won\'t hear about new edges or changes until you turn it back on.',
+        okLabel: 'Turn off',
+        run: async () => { S.settings = await api('PUT', '/settings', { clear_gateway: true }); S.status = await api('GET', '/status'); onSaved(); },
+      });
+    });
   }
-  if (how === 'server') {
-    return [
-      h('p', null, 'Gateways dial in to this controller. Run the install command on the server again with the gateway options added (keep any options you used the first time):'),
-      codeBlock('--gateway-listen 0.0.0.0:7444 --gateway-host <this server\'s public name or IP>'),
-      h('p', { class: 'hint' }, 'Then allow inbound TCP 7444 in the server\'s firewall and your provider\'s, so the gateway machine can reach it.'),
-      signedOut,
-    ];
+  return { fields, actions: h('div', { class: 'buttons' }, !locked && save, off) };
+}
+
+async function changeGateway(btn, errs, body, before, onSaved) {
+  btn.disabled = true;
+  showErrors(errs, []);
+  try {
+    S.settings = await api('PUT', '/settings', body);
+    S.status = await api('GET', '/status');
+    const enrolled = ((S.status && S.status.sites) || []).some((s) => s.gateway.enrolled);
+    const moved = body.gateway && before.host && before.host !== body.gateway.host;
+    toast(moved && enrolled ? 'Saved. Gateways already installed still dial the old address: re-enrol them from Sites & gateways.' : 'Saved');
+    onSaved();
+  } catch (e) {
+    if (e.status !== 401) showErrors(errs, e.lines);
+  } finally {
+    btn.disabled = false;
   }
-  return [
-    h('p', null, 'Gateways dial in to this controller. Start it with:'),
-    codeBlock('--gateway-listen 0.0.0.0:7444 --gateway-host <public hostname or IP>'),
-    h('p', { class: 'hint' }, 'and make that TCP port reachable from your gateway machine.'),
-    signedOut,
-  ];
 }
 
 function enrolReset() {
   clearInterval(enrolTimer);
   enrolTimer = null;
   showErrors($('#enrol-errors'), []);
-  for (const id of ['#enrol-prereq', '#enrol-main', '#enrol-ready', '#enrol-recheck', '#enrol-newcmd', '#enrol-live-sub']) $(id).hidden = true;
+  for (const id of ['#enrol-prereq', '#enrol-main', '#enrol-ready', '#enrol-newcmd', '#enrol-live-sub']) $(id).hidden = true;
   $('#enrol-cmd').textContent = '';
   $('#enrol-note').textContent = '';
 }
 
-function showListenerHelp() {
-  $('#enrol-prereq').replaceChildren(...listenerHelp());
+/** The gateway dialog while the controller isn't listening yet: ask where, then carry on. */
+async function showListenerForm(afterSaved) {
+  let settings;
+  try {
+    settings = await api('GET', '/settings');
+    S.settings = settings;
+  } catch (e) {
+    if (e.status !== 401) showErrors($('#enrol-errors'), e.lines);
+    return;
+  }
+  const c = gatewayControls(settings.gateway, afterSaved);
+  $('#enrol-prereq').replaceChildren(
+    h('p', null, 'Gateways dial in to this controller, and it isn\'t listening for them yet. Choose where it listens and we\'ll carry on.'),
+    ...c.fields, c.actions);
   $('#enrol-prereq').hidden = false;
-  $('#enrol-recheck').hidden = false;
 }
 
-/** Just the "how to turn gateways on" help, from the Sites page. */
+/** Just the listener controls, from the Sites page. */
 async function openListenerHelp() {
   enrolSite = null;
   enrolReset();
   $('#enrol-title').textContent = 'Turn on gateways';
-  showListenerHelp();
   openDialog('#enrol-dialog');
+  await showListenerForm(() => $('#enrol-dialog').close());
 }
 
 async function openEnrol(site) {
@@ -626,7 +667,7 @@ async function openEnrol(site) {
     if (e.status !== 401) showErrors($('#enrol-errors'), e.lines);
     return;
   }
-  if (!S.status.gateway_listener) return showListenerHelp();
+  if (!S.status.gateway_listener) return showListenerForm(async () => { $('#enrol-prereq').hidden = true; await issueCommand(); });
   await issueCommand();
 }
 
@@ -689,19 +730,6 @@ $('#enrol-close').addEventListener('click', () => $('#enrol-dialog').close());
 $('#enrol-dialog').addEventListener('close', () => { clearInterval(enrolTimer); enrolTimer = null; refresh(); });
 $('#enrol-copy').addEventListener('click', () => { const text = $('#enrol-cmd').textContent; if (text) copyText(text); });
 $('#enrol-newcmd').addEventListener('click', issueCommand);
-$('#enrol-recheck').addEventListener('click', async () => {
-  try {
-    S.status = await api('GET', '/status');
-  } catch (e) {
-    if (e.status !== 401) showErrors($('#enrol-errors'), e.lines);
-    return;
-  }
-  if (!S.status.gateway_listener) return toast('Still not listening for gateways');
-  $('#enrol-prereq').hidden = true;
-  $('#enrol-recheck').hidden = true;
-  if (enrolSite) await issueCommand();
-  else { toast('Gateways are on'); $('#enrol-dialog').close(); }
-});
 $('#enrol-route').addEventListener('click', () => {
   const id = enrolSite && enrolSite.id;
   $('#enrol-dialog').close();
@@ -911,6 +939,9 @@ async function renderSettings(main) {
   const wgSave = h('button', { class: 'primary', type: 'button' }, 'Save');
   wgSave.addEventListener('click', () => saveSection(wgSave, wgErr, { wg_network: hasSites ? undefined : wgNet.value.trim(), wg_port: Number(wgPort.value) }));
 
+  // Gateways
+  const gwc = gatewayControls(st.gateway, () => renderPage(true));
+
   // DNS
   const d = st.dns;
   const cfTok = h('input', { type: 'password', autocomplete: 'off', placeholder: d && d.token_set ? '•••••••• (set; leave blank to keep)' : 'Cloudflare API token (Zone · DNS · Edit)' });
@@ -941,6 +972,8 @@ async function renderSettings(main) {
       [field('Tunnel network', wgNet, hasSites ? 'Fixed while sites exist, because every tunnel address would change.' : 'A private range between /16 and /27. It must not overlap any site\'s LAN ranges.'),
         field('Edge UDP port', wgPort, 'Each edge listens here for its gateways, so allow it in the provider firewall.'), wgErr],
       h('div', { class: 'buttons' }, wgSave)),
+    sectionForm('Gateways', 'Lets WireGuard gateways on private networks (a home LAN, say) connect to this controller. Turning it on starts listening at once; no restart.',
+      gwc.fields, gwc.actions),
     sectionForm('DNS (Cloudflare)', 'Names listed here are pointed at every healthy edge, and unhealthy edges are removed. Only records created by edge-lb are ever changed. Records are DNS-only (never proxied), which TLS passthrough needs.',
       [field('API token', cfTok), field('Zone ID', zone), field('Names', names, 'One fully-qualified name per line.'), field('TTL (seconds)', ttl, '1 = automatic, otherwise 60–86400.'), dnsErr],
       h('div', { class: 'buttons' }, dnsSave, dnsOff)),

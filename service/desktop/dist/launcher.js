@@ -44,7 +44,7 @@ function render(state) {
     ...(l.agents.length
       ? fact('Can install on', l.agents.join(', ') + ' (Linux)')
       : fact('Can install on', 'nothing: no Linux builds found, so edges and gateways can’t be installed', 'warn')),
-    ...fact('Gateways', l.gateway || 'listener off (set it in app.toml to use home-network gateways)'),
+    ...fact('Gateways', l.gateway || 'listener off (turn it on in the controller\u2019s Settings, under Gateways)'),
     ...(l.running ? fact('Status', 'Running', 'ok') : []),
   );
   $('#start-local').textContent = l.running ? 'Open local controller' : 'Start local controller';

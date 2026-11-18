@@ -534,3 +534,188 @@ async fn edge_state_persists_in_the_controller_json_shape_for_old_controllers() 
     let s = c.settings_view();
     assert_eq!((s.wg_network.as_str(), s.wg_port), ("10.100.0.0/24", 51820));
 }
+
+// ---- the gateway listener, changed from Settings --------------------------------------------------
+
+use edge_lbd::controller::GatewayUpdate;
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn upd(listen: &str, host: &str) -> Option<GatewayUpdate> {
+    Some(GatewayUpdate { listen: listen.into(), host: host.into() })
+}
+
+fn accepts(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().unwrap(), Duration::from_millis(500)).is_ok()
+}
+
+/// Wait until `port` can be bound again (a stopped controller releases it asynchronously).
+async fn wait_free(port: u16) {
+    for _ in 0..60 {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("port {port} never became free");
+}
+
+async fn plain_controller(dir: &Path) -> Arc<Controller> {
+    let mut o = Options::new(dir.to_path_buf());
+    o.tick = Duration::from_secs(3600);
+    Controller::start(o).await.unwrap()
+}
+
+fn invalid(r: Result<(), CtlError>) -> Vec<String> {
+    match r {
+        Err(CtlError::Invalid(v)) => v,
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_gateway_listener_can_be_turned_on_changed_and_off_without_a_restart() {
+    let dir = tmp("gwset").join("ctl");
+    let ctl = plain_controller(&dir).await;
+    let v = ctl.settings_view().gateway;
+    assert!(v.listen.is_none() && v.active.is_none() && !v.locked, "off by default: {v:?}");
+    site(&ctl, "Home", &["192.168.1.0/24"]).unwrap();
+    assert!(ctl.start_enrolment("t", "home").is_err(), "no command without a listener");
+
+    let (p1, p2) = (free_port(), free_port());
+    ctl.set_gateway("t", upd(&format!("127.0.0.1:{p1}"), "ctl.example.com")).await.unwrap();
+    assert!(accepts(p1), "really listening");
+    let v = ctl.settings_view().gateway;
+    assert_eq!((v.listen.as_deref(), v.host.as_deref()), (Some(format!("127.0.0.1:{p1}").as_str()), Some("ctl.example.com")));
+    assert_eq!(v.active, Some(format!("ctl.example.com:{p1}")));
+    let cmd = ctl.start_enrolment("t", "home").unwrap().command;
+    assert!(cmd.contains(&format!("ctl.example.com:{p1}")), "{cmd}");
+
+    // Change both the port and the address gateways dial.
+    ctl.set_gateway("t", upd(&format!("127.0.0.1:{p2}"), "10.0.0.5")).await.unwrap();
+    assert!(accepts(p2) && !accepts(p1), "moved: the old port is closed, the new one open");
+    assert_eq!(ctl.settings_view().gateway.active, Some(format!("10.0.0.5:{p2}")));
+
+    // Same port, different host: must not trip over its own previous socket.
+    ctl.set_gateway("t", upd(&format!("127.0.0.1:{p2}"), "ctl.example.org")).await.unwrap();
+    assert!(accepts(p2));
+    assert_eq!(ctl.settings_view().gateway.active, Some(format!("ctl.example.org:{p2}")));
+
+    ctl.set_gateway("t", None).await.unwrap();
+    assert!(!accepts(p2), "closed");
+    let v = ctl.settings_view().gateway;
+    assert!(v.listen.is_none() && v.active.is_none());
+    assert!(ctl.start_enrolment("t", "home").is_err());
+    ctl.stop();
+}
+
+#[tokio::test]
+async fn a_saved_listener_comes_back_after_a_restart() {
+    let dir = tmp("gwsave").join("ctl");
+    let ctl = plain_controller(&dir).await;
+    let p = free_port();
+    ctl.set_gateway("t", upd(&format!("127.0.0.1:{p}"), "ctl.example.com")).await.unwrap();
+    ctl.stop();
+    drop(ctl);
+    wait_free(p).await;
+
+    let again = plain_controller(&dir).await;
+    wait_for("the saved listener to come back", || again.gateway_endpoint().is_some()).await;
+    assert!(accepts(p));
+    assert_eq!(again.settings_view().gateway.active, Some(format!("ctl.example.com:{p}")));
+    again.stop();
+}
+
+#[tokio::test]
+async fn a_saved_listener_that_cannot_start_is_reported_not_fatal() {
+    let dir = tmp("gwbroken").join("ctl");
+    let ctl = plain_controller(&dir).await;
+    let p = free_port();
+    ctl.set_gateway("t", upd(&format!("127.0.0.1:{p}"), "ctl.example.com")).await.unwrap();
+    ctl.stop();
+    drop(ctl);
+    wait_free(p).await;
+
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", p)).unwrap();
+    let again = plain_controller(&dir).await; // must still start
+    let v = again.settings_view().gateway;
+    assert!(v.active.is_none(), "not listening");
+    assert_eq!(v.listen.as_deref(), Some(format!("127.0.0.1:{p}").as_str()), "the saved setting is still shown so it can be fixed");
+    assert!(v.error.as_deref().is_some_and(|e| !e.is_empty()), "says why: {v:?}");
+
+    drop(squatter);
+    again.set_gateway("t", upd(&format!("127.0.0.1:{p}"), "ctl.example.com")).await.unwrap();
+    let v = again.settings_view().gateway;
+    assert!(v.error.is_none() && v.active.is_some(), "fixed: {v:?}");
+    again.stop();
+}
+
+#[tokio::test]
+async fn a_failed_change_leaves_the_working_listener_and_the_saved_setting_alone() {
+    let dir = tmp("gwfail").join("ctl");
+    let ctl = plain_controller(&dir).await;
+    let (p1, p2) = (free_port(), free_port());
+    ctl.set_gateway("t", upd(&format!("127.0.0.1:{p1}"), "ctl.example.com")).await.unwrap();
+
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", p2)).unwrap();
+    let errs = invalid(ctl.set_gateway("t", upd(&format!("127.0.0.1:{p2}"), "other.example.com")).await);
+    assert!(errs.iter().any(|e| e.contains(&p2.to_string())), "names the address: {errs:?}");
+    drop(squatter);
+
+    assert!(accepts(p1), "the old listener is still serving");
+    let v = ctl.settings_view().gateway;
+    assert_eq!(v.listen.as_deref(), Some(format!("127.0.0.1:{p1}").as_str()));
+    assert_eq!(v.host.as_deref(), Some("ctl.example.com"));
+    assert_eq!(v.active, Some(format!("ctl.example.com:{p1}")));
+    ctl.stop();
+}
+
+#[tokio::test]
+async fn gateway_listener_values_are_validated_and_nothing_is_bound_on_a_bad_one() {
+    let dir = tmp("gwbad").join("ctl");
+    let ctl = plain_controller(&dir).await;
+    let p = free_port();
+    let good = format!("127.0.0.1:{p}");
+    let cases = [
+        ("0.0.0.0", "ctl.example.com"),
+        ("7444", "ctl.example.com"),
+        ("0.0.0.0:0", "ctl.example.com"),
+        ("0.0.0.0:99999", "ctl.example.com"),
+        ("localhost:7444", "ctl.example.com"),
+        ("", "ctl.example.com"),
+        (good.as_str(), ""),
+        (good.as_str(), "a b"),
+        (good.as_str(), "a;b"),
+        (good.as_str(), "x\nExecStartPre=/bin/sh"),
+        (good.as_str(), "$(id)"),
+        (good.as_str(), "[::1]"),
+        (good.as_str(), "-bad.example.com"),
+    ];
+    for (listen, host) in cases {
+        let errs = invalid(ctl.set_gateway("t", upd(listen, host)).await);
+        assert!(!errs.is_empty(), "{listen:?} {host:?}");
+        assert!(ctl.gateway_endpoint().is_none() && !accepts(p), "{listen:?} {host:?} left a listener behind");
+    }
+    ctl.stop();
+}
+
+#[tokio::test]
+async fn startup_options_fix_the_listener_so_settings_cannot_fight_them() {
+    let dir = tmp("gwlock").join("ctl");
+    let p = free_port();
+    let mut o = Options::new(dir);
+    o.tick = Duration::from_secs(3600);
+    o.gateway = Some(edge_lbd::controller::sites::GatewayListen { listen: format!("127.0.0.1:{p}").parse().unwrap(), host: "ctl.example.com".into() });
+    let ctl = Controller::start(o).await.unwrap();
+
+    let v = ctl.settings_view().gateway;
+    assert!(v.locked && v.active.is_some(), "{v:?}");
+    assert_eq!(v.listen.as_deref(), Some(format!("127.0.0.1:{p}").as_str()));
+    for r in [ctl.set_gateway("t", upd("127.0.0.1:9", "x.example.com")).await, ctl.set_gateway("t", None).await] {
+        assert!(matches!(r, Err(CtlError::Conflict(_))), "{r:?}");
+    }
+    assert!(accepts(p), "still serving");
+    ctl.stop();
+}

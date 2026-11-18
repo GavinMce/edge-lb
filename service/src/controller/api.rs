@@ -310,6 +310,17 @@ async fn get_settings(State(st): State<AppState>) -> Json<Value> {
 }
 
 async fn put_settings(State(st): State<AppState>, Extension(Actor(u)): Extension<Actor>, Json(b): Json<SettingsUpdate>) -> Res<Json<Value>> {
+    if b.gateway.is_some() && b.clear_gateway {
+        return Err(CtlError::Invalid(vec!["send either gateway or clear_gateway, not both".into()]).into());
+    }
+    // The gateway listener is applied immediately (it binds a port), on its own; every other setting
+    // goes through the usual validated update.
+    if b.gateway.is_some() || b.clear_gateway {
+        st.ctl.set_gateway(&u, b.gateway.clone()).await?;
+        if b.only_gateway() {
+            return Ok(Json(json!(st.ctl.settings_view())));
+        }
+    }
     Ok(Json(json!(st.ctl.update_settings(&u, b)?)))
 }
 

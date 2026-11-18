@@ -120,3 +120,6 @@ pre.code { background: var(--code); border-radius: 8px; padding: 10px 12px; marg
 .codebox { position: relative; margin: 8px 0; }
 .codebox pre.code { margin: 0; padding-right: 64px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .codebox button { position: absolute; top: 6px; right: 6px; }
+
+/* Gateway settings */
+.gw-state { display: flex; align-items: center; gap: 8px; margin: 6px 0 10px; }
