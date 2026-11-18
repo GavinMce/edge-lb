@@ -1,5 +1,6 @@
 //! edge-lbd: a configurable L4 edge load balancer with a web UI, plus a controller that
 //! creates and manages a fleet of edges.
+pub mod accesslog;
 pub mod api;
 pub mod config;
 pub mod controller;

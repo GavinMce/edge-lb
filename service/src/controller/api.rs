@@ -333,6 +333,11 @@ async fn audit(State(st): State<AppState>) -> Json<Value> {
     Json(json!(st.ctl.audit.tail(200)))
 }
 
+/// Recent connections from the edges (see `controller::logs`). Filters are query parameters.
+async fn logs(State(st): State<AppState>, Query(q): Query<super::logs::LogQuery>) -> Res<Json<super::logs::LogsView>> {
+    Ok(Json(st.ctl.access_logs(q).await?))
+}
+
 fn asset(content_type: &'static str, body: &'static str) -> Response {
     let mut r = body.into_response();
     let h = r.headers_mut();
@@ -361,6 +366,7 @@ pub fn router(ctl: Arc<Controller>, secure_cookies: bool) -> Router {
         .route("/settings", get(get_settings).put(put_settings))
         .route("/ssh-key", get(ssh_key))
         .route("/audit", get(audit))
+        .route("/logs", get(logs))
         .route("/password", post(change_password))
         .layer(middleware::from_fn_with_state(st.clone(), require_auth));
     let open = Router::new().route("/session", get(session)).route("/setup", post(setup)).route("/login", post(login)).route("/logout", post(logout));

@@ -2,12 +2,13 @@
 //!
 //! The edge keeps working from its last applied config if the controller disappears.
 
+use crate::accesslog::Kind;
 use crate::api::ApiError;
 use crate::config::Route;
 use crate::engine::{Engine, Options, StatusView};
 use crate::{pki, tls};
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -115,6 +116,7 @@ pub async fn start(mut opts: EdgeOptions) -> Result<EdgeHandle> {
     let app = Router::new()
         .route("/v1/info", get(info))
         .route("/v1/status", get(status))
+        .route("/v1/connections", get(connections))
         .route("/v1/config", axum::routing::put(put_config))
         .with_state(state);
 
@@ -129,6 +131,28 @@ async fn info(State(s): State<Arc<EdgeState>>) -> Json<Info> {
 
 async fn status(State(s): State<Arc<EdgeState>>) -> Json<StatusResp> {
     Json(StatusResp { generation: *s.generation.lock().await, status: s.engine.status().await })
+}
+
+#[derive(Deserialize)]
+struct ConnQuery {
+    /// Only entries newer than this sequence number.
+    #[serde(default)]
+    after: u64,
+    #[serde(default = "default_page")]
+    limit: usize,
+    /// `all` (default), `traffic` or `rejects`.
+    #[serde(default)]
+    kind: String,
+}
+
+fn default_page() -> usize {
+    200
+}
+
+/// Recent connections this edge handled, newest `limit` of those after `after`, oldest first.
+async fn connections(State(s): State<Arc<EdgeState>>, Query(q): Query<ConnQuery>) -> Result<Json<crate::accesslog::Page>, ApiError> {
+    let kind = Kind::parse(&q.kind).ok_or_else(|| ApiError::from(crate::engine::EngineError::Invalid(vec![format!("unknown kind \"{}\" (use all, traffic or rejects)", q.kind)])))?;
+    Ok(Json(s.engine.access_log().page(q.after, q.limit, kind)))
 }
 
 /// Hand the validated WireGuard state to the root applier by writing it where that daemon looks.

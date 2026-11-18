@@ -58,6 +58,12 @@ impl EdgeClient {
         self.get("/v1/status").await
     }
 
+    /// Recent connections. `kind` is `all`, `traffic` or `rejects`. Edges older than this call
+    /// answer 404, which the caller reports as "update this edge".
+    pub async fn connections(&self, after: u64, limit: usize, kind: &str) -> Result<Value, ClientError> {
+        self.get(&format!("/v1/connections?after={after}&limit={limit}&kind={kind}")).await
+    }
+
     pub async fn put_config(&self, generation: u64, routes: &[Route], wg: Option<&crate::wg::Desired>) -> Result<(), ClientError> {
         let r = self
             .http

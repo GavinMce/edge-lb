@@ -362,3 +362,22 @@ async fn ui_assets_use_a_strict_csp_without_inline_code() {
     assert!(!html.contains("<script>") && !html.contains(" style="), "inline script/style would be blocked by the CSP");
     assert_eq!(http(r.addr, "GET", "/healthz", Opts::default()).await.body, "ok");
 }
+
+#[tokio::test]
+async fn the_connection_log_needs_a_session_and_validates_its_filters() {
+    let r = start("logs").await;
+    // Not signed in: no log, and certainly no client addresses.
+    assert_eq!(http(r.addr, "GET", "/api/logs", Opts::default()).await.status, 401);
+    let ck = signed_in(&r).await;
+    // No edges yet: an empty, well-formed answer.
+    let resp = api(&r, &ck, "GET", "/api/logs", None).await;
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let v = resp.json();
+    assert_eq!(v["entries"], json!([]));
+    assert_eq!(v["sources"], json!([]));
+    // Filters are checked; the limit is clamped rather than refused.
+    assert_eq!(api(&r, &ck, "GET", "/api/logs?outcome=sideways", None).await.status, 422);
+    assert_eq!(api(&r, &ck, "GET", "/api/logs?edge=nowhere", None).await.status, 404);
+    assert_eq!(api(&r, &ck, "GET", "/api/logs?limit=999999&host=%20", None).await.status, 200);
+    assert_eq!(api(&r, &ck, "GET", "/api/logs?limit=abc", None).await.status, 400);
+}

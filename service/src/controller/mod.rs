@@ -11,6 +11,7 @@ pub mod auth;
 pub mod bootstrap;
 pub mod dns;
 pub mod lifecycle;
+pub mod logs;
 pub mod model;
 pub mod providers;
 pub mod sites;
