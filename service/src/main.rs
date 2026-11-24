@@ -357,6 +357,13 @@ async fn controller(args: ControllerArgs) -> Result<()> {
     if let Some(d) = &args.agents_dir {
         opts.agents.discover(d);
     }
+    for (arch, path) in opts.agents.dynamically_linked() {
+        tracing::warn!(
+            "the {arch} edge binary ({}) is dynamically linked: it will fail on machines with an older glibc. \
+             Run the static build (target x86_64-unknown-linux-musl) or pass --edge-binary / --agents-dir with static builds",
+            path.display()
+        );
+    }
     if opts.agents.is_empty() {
         tracing::warn!("no Linux edge binaries found (looked for `agents/edge-lbd-<arch>` beside this program): edges and gateways can't be installed until you pass --agents-dir or --edge-binary");
     } else {
