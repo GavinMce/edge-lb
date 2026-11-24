@@ -90,7 +90,7 @@ impl SshKey {
 }
 
 /// Don't flash a console window for every `ssh` when the controller runs as a Windows GUI app.
-fn quiet(cmd: &mut Command) -> &mut Command {
+pub fn quiet(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -101,7 +101,7 @@ fn quiet(cmd: &mut Command) -> &mut Command {
 
 /// `-o UserKnownHostsFile=...`. OpenSSH splits option values on spaces, and Windows profile paths
 /// often have one, so there the path is quoted and uses forward slashes.
-fn known_hosts_option(path: &Path) -> String {
+pub fn known_hosts_option(path: &Path) -> String {
     #[cfg(windows)]
     {
         format!("UserKnownHostsFile=\"{}\"", path.display().to_string().replace('\\', "/"))

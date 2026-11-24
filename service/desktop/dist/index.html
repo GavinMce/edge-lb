@@ -64,8 +64,25 @@
         <input id="s-gwhost" type="text" spellcheck="false" placeholder="vps.example.com or 198.51.100.7"></label>
       <label class="check"><input id="s-root" type="checkbox"> I'm logged in as root on the server (no sudo)</label>
       <div id="setup-error" class="err" role="alert" hidden></div>
-      <div class="actions"><button id="setup-go" class="primary" type="submit">Show the commands</button></div>
+      <div class="actions">
+        <button id="setup-go" class="primary" type="submit">Show the commands</button>
+        <button id="setup-auto" class="primary" type="button" hidden>Install it for me</button>
+      </div>
+      <p id="setup-auto-note" class="hint" hidden>“Install it for me” logs in with the SSH key you already use (this app never sees a password), installs the controller, keeps the tunnel open for you and connects. It needs <code>ssh user@host</code> to work from this PC without a password prompt, and root or a user that can run <code>sudo</code> without one.</p>
     </form>
+    <div id="hostkey" class="trust" role="group" aria-labelledby="hk-h" hidden>
+      <strong id="hk-h">Is this your server?</strong>
+      <p class="muted">This is the first time this app has connected to it. Check that the fingerprint is the server's own: your provider's console often shows it, or run <code>ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub</code> on the server.</p>
+      <dl class="facts">
+        <dt>Server</dt><dd id="hk-host" class="mono"></dd>
+        <dt>Key</dt><dd id="hk-alg"></dd>
+        <dt>Fingerprint</dt><dd id="hk-fp" class="mono"></dd>
+      </dl>
+      <div class="actions">
+        <button id="hk-no" type="button">Cancel</button>
+        <button id="hk-yes" class="primary" type="button">It matches: trust it and continue</button>
+      </div>
+    </div>
     <ol id="setup-steps" class="steps" hidden></ol>
     <div id="setup-connect" class="connect" hidden>
       <span>Then connect to</span> <code id="setup-url"></code>

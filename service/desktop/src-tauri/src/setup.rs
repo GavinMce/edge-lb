@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 
 /// The controller's web UI port on the server, and the local port the SSH tunnel uses.
-const UI_PORT: u16 = 8080;
+pub const UI_PORT: u16 = 8080;
 const TUNNEL_PORT: u16 = 8081;
 const GATEWAY_PORT: u16 = 7444;
-const DATA_DIR: &str = "/var/lib/edge-lb-controller";
+/// Where the installer keeps the controller's data (and the pending first-run setup code).
+pub const DATA_DIR: &str = "/var/lib/edge-lb-controller";
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +51,24 @@ pub struct SetupPlan {
     pub steps: Vec<Step>,
     /// What to type into the launcher's address field afterwards.
     pub connect_url: Option<String>,
+    /// The install command on its own, for running it over SSH instead of showing it.
+    #[serde(skip)]
+    pub installer: Installer,
+}
+
+/// The one-line installer, before it is told how to get root.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Installer {
+    url: String,
+    args: String,
+}
+
+impl Installer {
+    /// `sudo` is the prefix that gets root: `""` when already root, `"sudo "` to show a person, or
+    /// `"sudo -n "` when nobody is there to type a password (it fails rather than waiting).
+    pub fn command(&self, sudo: &str) -> String {
+        format!("curl -fsSL {} | {sudo}sh -s --{}", self.url, self.args)
+    }
 }
 
 /// `repo` is the `owner/name` of the GitHub repository the releases live in.
@@ -127,7 +146,8 @@ pub fn plan(req: &SetupRequest, repo: &str) -> Result<SetupPlan, String> {
 
     let sudo = if req.root { "" } else { "sudo " };
     let args = if flags.is_empty() { String::new() } else { format!(" {}", flags.join(" ")) };
-    let install = format!("curl -fsSL https://github.com/{repo}/releases/latest/download/install-controller.sh | {sudo}sh -s --{args}");
+    let installer = Installer { url: format!("https://github.com/{repo}/releases/latest/download/install-controller.sh"), args };
+    let install = installer.command(sudo);
 
     let mut steps = vec![Step {
         title: "Install it on the server".into(),
@@ -141,7 +161,7 @@ pub fn plan(req: &SetupRequest, repo: &str) -> Result<SetupPlan, String> {
         note: "Use the address below in \"Connect to a new one\". The setup code is printed at the end of the install; to see it again:".into(),
         command: Some(format!("{sudo}cat {DATA_DIR}/setup-code")),
     });
-    Ok(SetupPlan { steps, connect_url })
+    Ok(SetupPlan { steps, connect_url, installer })
 }
 
 // ---- the grammar every typed value must fit -----------------------------------------------------
@@ -156,7 +176,7 @@ fn github_slug(repo: &str) -> Result<String, String> {
     }
 }
 
-fn is_hostname(s: &str) -> bool {
+pub fn is_hostname(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 253
         && s.split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
@@ -229,6 +249,18 @@ mod tests {
         root.login = Some("root@h.example.com".into());
         root.root = true;
         assert!(!cmd(&plan(&root, REPO).unwrap(), 0).contains("sudo"), "logged in as root: no sudo");
+    }
+
+    #[test]
+    fn the_installer_is_the_same_command_with_a_different_way_to_get_root() {
+        let mut r = req(Access::Tunnel);
+        r.login = Some("admin@vps.example.com".into());
+        r.gateways = true;
+        let p = plan(&r, REPO).unwrap();
+        assert_eq!(p.installer.command("sudo "), cmd(&p, 0), "the shown command is the installer's");
+        let auto = p.installer.command("sudo -n ");
+        assert!(auto.starts_with("curl -fsSL https://github.com/Someone/edge-lb/releases/latest/download/install-controller.sh | sudo -n sh -s -- --gateway-listen"), "{auto}");
+        assert!(!p.installer.command("").contains("sudo"));
     }
 
     #[test]

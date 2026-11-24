@@ -108,6 +108,30 @@ with two choices:
   saved or shown. `https://` is required, except for private-network addresses (LAN, Tailscale, `127.0.0.1`
   through an SSH tunnel), because the sign-in cookie must not travel unencrypted.
 
+**Set up a controller on a server** (in the launcher) turns a few answers into the install command. With the
+*SSH tunnel* option it can also do everything for you: **Install it for me** runs the install over SSH, opens
+the tunnel, fills in the setup code and connects, so there is nothing to paste and no second window to keep
+open.
+
+- It uses the Windows OpenSSH client and the keys you already use (your `.ssh` folder, ssh-agent), in batch
+  mode: it never asks for, sees or stores a password. `ssh user@host` must already work from this PC without
+  a prompt, and the user must be `root` or able to run `sudo` without a password (the app uses `sudo -n`, so
+  it fails with an explanation instead of waiting). Otherwise use **Show the commands** and paste them yourself.
+- **The first time** it shows the server's SSH host key fingerprint to confirm (compare it with your provider's
+  console, or `ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub` on the server). Once confirmed it is kept in
+  `%APPDATA%\edge-lb\ssh\known_hosts`, and every later connection insists on exactly that key.
+  The key is read with `ssh` itself, with no authentication tried, so none of your keys is offered to a
+  server you haven't confirmed yet.
+- The install is the same one-line script as the pasted command, so running it again on a server upgrades it
+  (and signs you in if the account exists). Other options (private address, HTTPS proxy) still need a
+  firewall, DNS or proxy set up by hand, so they stay as written steps.
+- The controller is saved in the list as *Through an SSH tunnel to user@host*. Connecting to it starts the
+  tunnel again, on the same local port when that is free, and keeps it open (reconnecting if the network
+  drops) until you forget the controller or quit the app. `%APPDATA%\edge-lb\ssh\tunnel.log` has what `ssh` said.
+- **Tested** against the real Windows OpenSSH: host key reading (it matches the fingerprint the provider
+  publishes), refusal when the key changes, and the failure messages. **Not yet tested:** a successful install and
+  tunnel against a real server from Windows.
+
 The controller's page then opens in its own window. That window can only show the controller it was opened
 for, and it has no access to the app: only the launcher page may call into it. Closing a window hides it to the
 tray. The tray menu has **Switch controller…** (back to the launcher) and **Quit**, which stops the local
