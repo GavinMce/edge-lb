@@ -3,5 +3,5 @@
   "identifier": "launcher",
   "description": "Only the launcher page may call into the app. The window that shows a controller is an external page and gets no capability at all.",
   "windows": ["launcher"],
-  "permissions": ["allow-get-state", "allow-start-local", "allow-connect-remote", "allow-forget-remote", "allow-plan-setup"]
+  "permissions": ["allow-get-state", "allow-start-local", "allow-connect-remote", "allow-forget-remote", "allow-plan-setup", "allow-check-host", "allow-trust-host", "allow-setup-server"]
 }

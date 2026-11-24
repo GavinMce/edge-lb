@@ -84,6 +84,19 @@ pub struct Remote {
     /// Unix seconds of the last successful connection.
     #[serde(default)]
     pub last_used: u64,
+    /// Set when this controller listens only on its own server: the app opens an SSH tunnel to it
+    /// and `url` is the local end of that tunnel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshTunnel>,
+}
+
+/// How to reach a controller through SSH.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SshTunnel {
+    /// `user@host`.
+    pub login: String,
+    /// The port the controller's UI listens on, on the server's loopback.
+    pub remote_port: u16,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -111,15 +124,26 @@ pub fn save_remotes(dir: &Path, remotes: &[Remote]) -> Result<()> {
 }
 
 /// Add `url` to the list, or update its name and time. Most recently used first.
-pub fn remember(list: &mut Vec<Remote>, url: &str, name: Option<&str>, now: u64) {
-    match list.iter_mut().find(|r| r.url == url) {
+///
+/// A controller reached through an SSH tunnel is the same controller whichever local port the tunnel
+/// got this time, so it is found by its login and its `url` is updated instead of a second entry added.
+pub fn remember(list: &mut Vec<Remote>, url: &str, name: Option<&str>, ssh: Option<SshTunnel>, now: u64) {
+    let same = |r: &Remote| match &ssh {
+        Some(t) => r.ssh.as_ref() == Some(t),
+        None => r.url == url,
+    };
+    match list.iter_mut().find(|r| same(r)) {
         Some(r) => {
             r.last_used = now;
+            r.url = url.to_string();
             if let Some(n) = name {
                 r.name = n.to_string();
             }
         }
-        None => list.push(Remote { name: name.map(str::to_string).unwrap_or_else(|| default_name(url)), url: url.to_string(), last_used: now }),
+        None => {
+            let name = name.map(str::to_string).unwrap_or_else(|| default_name(url));
+            list.push(Remote { name, url: url.to_string(), last_used: now, ssh });
+        }
     }
     list.sort_by(|a, b| b.last_used.cmp(&a.last_used).then_with(|| a.name.cmp(&b.name)));
 }
@@ -223,14 +247,33 @@ mod tests {
     #[test]
     fn remembering_updates_in_place_and_orders_by_recent_use() {
         let mut l = Vec::new();
-        remember(&mut l, "https://a.example", None, 10);
-        remember(&mut l, "https://b.example:8443", Some("Backup"), 20);
+        remember(&mut l, "https://a.example", None, None, 10);
+        remember(&mut l, "https://b.example:8443", Some("Backup"), None, 20);
         assert_eq!(l.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["Backup", "a.example"]);
-        remember(&mut l, "https://a.example", Some("Home"), 30);
+        remember(&mut l, "https://a.example", Some("Home"), None, 30);
         assert_eq!(l.len(), 2);
         assert_eq!((l[0].name.as_str(), l[0].last_used), ("Home", 30));
-        remember(&mut l, "https://b.example:8443", None, 40);
+        remember(&mut l, "https://b.example:8443", None, None, 40);
         assert_eq!(l[0].name, "Backup", "a connect without a name keeps the saved name");
+    }
+
+    #[test]
+    fn a_tunnel_remote_is_one_entry_whichever_local_port_it_gets() {
+        let via = |login: &str| Some(SshTunnel { login: login.into(), remote_port: 8080 });
+        let mut l = Vec::new();
+        remember(&mut l, "http://127.0.0.1:50001/", Some("vps.example.com"), via("root@vps.example.com"), 10);
+        remember(&mut l, "http://127.0.0.1:50077/", None, via("root@vps.example.com"), 20);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert_eq!((l[0].url.as_str(), l[0].name.as_str(), l[0].last_used), ("http://127.0.0.1:50077/", "vps.example.com", 20));
+        // Another login is another controller; so is a hand-made tunnel on some other local port.
+        remember(&mut l, "http://127.0.0.1:50001/", None, via("admin@other.example.com"), 30);
+        remember(&mut l, "http://127.0.0.1:50099/", None, None, 40);
+        assert_eq!(l.len(), 3, "{l:?}");
+        assert_eq!(l.iter().filter(|r| r.ssh.is_none()).count(), 1);
+        // The same address as a managed tunnel is that controller: it keeps its tunnel.
+        remember(&mut l, "http://127.0.0.1:50077/", None, None, 50);
+        assert_eq!(l.len(), 3, "{l:?}");
+        assert!(l[0].ssh.is_some() && l[0].last_used == 50);
     }
 
     #[test]
@@ -241,9 +284,17 @@ mod tests {
 
         assert!(load_remotes(&dir).unwrap().is_empty());
         let mut l = Vec::new();
-        remember(&mut l, "https://a.example", Some("A \"quoted\" name"), 5);
+        remember(&mut l, "https://a.example", Some("A \"quoted\" name"), None, 5);
+        remember(&mut l, "http://127.0.0.1:50001/", Some("Tunnelled"), Some(SshTunnel { login: "root@vps.example.com".into(), remote_port: 8080 }), 6);
         save_remotes(&dir, &l).unwrap();
         assert_eq!(load_remotes(&dir).unwrap(), l);
+        // Files written before tunnels existed have no `ssh` key and still load.
+        std::fs::write(dir.join("remotes.toml"), "[[remote]]
+name = \"Old\"
+url = \"https://old.example\"
+last_used = 3
+").unwrap();
+        assert_eq!(load_remotes(&dir).unwrap()[0].ssh, None);
         std::fs::write(dir.join("remotes.toml"), "this is = not [valid").unwrap();
         assert!(load_remotes(&dir).is_err());
 

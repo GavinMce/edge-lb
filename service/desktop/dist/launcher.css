@@ -74,4 +74,7 @@ select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .cmd pre { margin: 0; padding: 10px 76px 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font: .92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; user-select: all; }
 .cmd button { position: absolute; top: 6px; right: 6px; }
 .connect { margin-top: 14px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.connect code { background: var(--chip); padding: 2px 8px; border-radius: 6px; }
+.connect code, .hint code, .trust code { background: var(--chip); padding: 1px 6px; border-radius: 6px; }
+#setup-error { white-space: pre-wrap; }
+.trust { margin-top: 14px; border: 1px solid var(--warn); border-radius: 10px; padding: 12px 14px; }
+.trust .facts { margin: 8px 0; }

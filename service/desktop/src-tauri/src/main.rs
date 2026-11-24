@@ -16,9 +16,10 @@
 
 mod config;
 mod setup;
+mod ssh;
 
 use anyhow::{anyhow, bail, Context, Result};
-use config::{AppConfig, Remote};
+use config::{AppConfig, Remote, SshTunnel};
 use edge_lbd::controller::{agents::Agents, sites::GatewayListen, Controller, Options};
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -43,6 +44,9 @@ struct AppState {
     /// Label of the window currently showing a controller, if any.
     current: Mutex<Option<String>>,
     seq: AtomicU32,
+    /// Logging in to servers with the OpenSSH client, and the tunnels kept open to them.
+    ssh: ssh::Ssh,
+    tunnels: ssh::Tunnels,
 }
 
 /// The local controller, once started. It keeps running until the app quits, so switching to a
@@ -59,7 +63,7 @@ fn main() {
         // A second launch just brings the existing window forward.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![get_state, start_local, connect_remote, forget_remote, plan_setup])
+        .invoke_handler(tauri::generate_handler![get_state, start_local, connect_remote, forget_remote, plan_setup, check_host, trust_host, setup_server])
         .setup(|app| {
             if let Err(e) = setup(app.handle()) {
                 tracing::error!("startup failed: {e:#}");
@@ -90,6 +94,8 @@ fn setup(app: &AppHandle) -> Result<()> {
     let (cfg, notice) = AppConfig::load(&config_dir);
     let startup = cfg.startup.clone().unwrap_or_else(|| "ask".into());
     app.manage(AppState {
+        ssh: ssh::Ssh::new(&config_dir),
+        tunnels: ssh::Tunnels::default(),
         config_dir,
         cfg,
         notice: Mutex::new(notice.clone()),
@@ -185,7 +191,7 @@ async fn connect_remote(app: AppHandle, st: State<'_, AppState>, url: String, na
     if name.as_ref().is_some_and(|n| n.chars().count() > 60 || n.chars().any(char::is_control)) {
         return Err("Use a shorter name, without control characters.".into());
     }
-    connect_to(&app, &st, &url, name.as_deref()).await.map_err(|e| {
+    connect_to(&app, &st, &url, name.as_deref(), None, None).await.map_err(|e| {
         tracing::warn!("connecting to {url} failed: {e:#}");
         format!("{e:#}")
     })
@@ -194,6 +200,10 @@ async fn connect_remote(app: AppHandle, st: State<'_, AppState>, url: String, na
 #[tauri::command]
 async fn forget_remote(st: State<'_, AppState>, url: String) -> std::result::Result<(), String> {
     let mut list = config::load_remotes(&st.config_dir).map_err(|e| format!("{e:#}"))?;
+    // A forgotten controller's tunnel is closed with it.
+    if let Some(via) = list.iter().find(|r| r.url == url).and_then(|r| r.ssh.as_ref()) {
+        st.tunnels.stop_login(&via.login).await;
+    }
     list.retain(|r| r.url != url);
     config::save_remotes(&st.config_dir, &list).map_err(|e| format!("{e:#}"))
 }
@@ -204,7 +214,46 @@ fn plan_setup(request: setup::SetupRequest) -> std::result::Result<setup::SetupP
     setup::plan(&request, env!("CARGO_PKG_REPOSITORY"))
 }
 
+/// Is this server's SSH host key already trusted? If not, what is its fingerprint, to be confirmed.
+#[tauri::command]
+async fn check_host(st: State<'_, AppState>, login: String) -> std::result::Result<ssh::HostKeyView, String> {
+    let login = ssh::Login::parse(&login)?;
+    st.ssh.check_host(&login).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Trust the server's SSH host key, if it still has the fingerprint the person confirmed.
+#[tauri::command]
+async fn trust_host(st: State<'_, AppState>, login: String, fingerprint: String) -> std::result::Result<(), String> {
+    let login = ssh::Login::parse(&login)?;
+    st.ssh.trust_host(&login, &fingerprint).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Install the controller on a server over SSH, open a tunnel to it, and show it.
+#[tauri::command]
+async fn setup_server(app: AppHandle, st: State<'_, AppState>, request: setup::SetupRequest) -> std::result::Result<(), String> {
+    run_setup_server(&app, &st, request).await.map_err(|e| {
+        tracing::warn!("setting up a server failed: {e:#}");
+        format!("{e:#}")
+    })
+}
+
 // ---- connecting -------------------------------------------------------------------------------------
+
+async fn run_setup_server(app: &AppHandle, st: &AppState, request: setup::SetupRequest) -> Result<()> {
+    if !matches!(request.access, setup::Access::Tunnel) {
+        bail!("Installing it for you works with the SSH tunnel option. For the other options, use \"Show the commands\".");
+    }
+    let login = ssh::Login::parse(request.login.as_deref().unwrap_or("")).map_err(|e| anyhow!(e))?;
+    let request = setup::SetupRequest { login: Some(login.target()), ..request };
+    let plan = setup::plan(&request, env!("CARGO_PKG_REPOSITORY")).map_err(|e| anyhow!(e))?;
+
+    st.ssh.install(&login, &plan.installer.command(login.sudo())).await?;
+    let code = st.ssh.setup_code(&login).await;
+
+    let via = SshTunnel { login: login.target(), remote_port: setup::UI_PORT };
+    let placeholder: Url = "http://127.0.0.1/".parse()?;
+    connect_to(app, st, &placeholder, Some(login.host()), Some(via), code.as_deref()).await
+}
 
 async fn connect_local(app: &AppHandle, st: &AppState) -> Result<()> {
     let (url, setup_code) = ensure_local(app, st).await?;
@@ -215,26 +264,44 @@ async fn connect_saved(app: &AppHandle, st: &AppState, name: &str) -> Result<()>
     let remotes = config::load_remotes(&st.config_dir)?;
     let r = remotes.iter().find(|r| r.name.eq_ignore_ascii_case(name)).ok_or_else(|| anyhow!("no saved controller is called \"{name}\" (see remotes.toml)"))?;
     let url = config::normalize_remote(&r.url).map_err(|e| anyhow!(e))?;
-    connect_to(app, st, &url, None).await
+    connect_to(app, st, &url, None, None, None).await
 }
 
-/// Check that `url` really is an edge-lb controller, remember it, and show it.
-async fn connect_to(app: &AppHandle, st: &AppState, url: &Url, name: Option<&str>) -> Result<()> {
+/// A controller that listens only on its own server is reached through an SSH tunnel. Open it (or
+/// find the one already open) and return the local address to use. `via` says how for a controller
+/// just set up; otherwise it is looked up in the saved list. Everything else is returned as it is.
+async fn resolve_tunnel(st: &AppState, url: &Url, via: Option<SshTunnel>) -> Result<(Url, Option<SshTunnel>)> {
+    let via = via.or_else(|| {
+        let saved = config::load_remotes(&st.config_dir).ok()?;
+        saved.into_iter().find(|r| r.url == config::origin_string(url)).and_then(|r| r.ssh)
+    });
+    let Some(via) = via else { return Ok((url.clone(), None)) };
+    // The saved file can be edited by hand: check the login again before it reaches a command line.
+    let login = ssh::Login::parse(&via.login).map_err(|e| anyhow!(e))?;
+    let port = st.tunnels.ensure(&st.ssh, &login, via.remote_port, url.port()).await.with_context(|| format!("opening the SSH tunnel to {}", login.target()))?;
+    Ok((format!("http://127.0.0.1:{port}/").parse()?, Some(via)))
+}
+
+/// Check that `url` really is an edge-lb controller, remember it, and show it. `setup_code` is typed
+/// into the first-run form for the person.
+async fn connect_to(app: &AppHandle, st: &AppState, url: &Url, name: Option<&str>, via: Option<SshTunnel>, setup_code: Option<&str>) -> Result<()> {
+    let (url, via) = resolve_tunnel(st, url, via).await?;
+    let url = &url;
     probe(url).await?;
     let origin = config::origin_string(url);
     match config::load_remotes(&st.config_dir) {
         Ok(mut list) => {
-            config::remember(&mut list, &origin, name, now());
+            config::remember(&mut list, &origin, name, via, now());
             let title = list.iter().find(|r| r.url == origin).map(|r| r.name.clone()).unwrap_or_default();
             if let Err(e) = config::save_remotes(&st.config_dir, &list) {
                 tracing::warn!("could not save remotes.toml: {e:#}");
             }
-            open_controller(app, st, url, &format!("edge-lb \u{2014} {title}"), None)
+            open_controller(app, st, url, &format!("edge-lb \u{2014} {title}"), setup_code)
         }
         Err(e) => {
             // Don't overwrite a file we couldn't read; connecting still works.
             tracing::warn!("not saving this controller: {e:#}");
-            open_controller(app, st, url, &format!("edge-lb \u{2014} {}", url.host_str().unwrap_or("remote")), None)
+            open_controller(app, st, url, &format!("edge-lb \u{2014} {}", url.host_str().unwrap_or("remote")), setup_code)
         }
     }
 }
@@ -353,6 +420,7 @@ async fn start_local_controller(app: &AppHandle, st: &AppState) -> Result<LocalS
 /// Stop serving and let the controller's background work wind down (bounded, so Quit never hangs).
 fn stop_local(app: &AppHandle) {
     let Some(st) = app.try_state::<AppState>() else { return };
+    tauri::async_runtime::block_on(st.tunnels.stop_all());
     let local = tauri::async_runtime::block_on(async { st.local.lock().await.take() });
     let Some(mut local) = local else { return };
     if let Some(stop) = local.stop.take() {
